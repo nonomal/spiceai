@@ -628,6 +628,10 @@ impl FlightClient {
 
         // If no token is found in headers, check trailers
         if token.is_none() {
+            println!(
+                "[{:?}] Starting trailer authentication",
+                std::time::Instant::now()
+            );
             let stream = resp.get_mut();
 
             match stream.trailers().await {
