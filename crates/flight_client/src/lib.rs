@@ -610,6 +610,7 @@ impl FlightClient {
                         source: TonicStatusError::from(e),
                     }
                 } else {
+                    println!("Failed to perform handshake");
                     Error::UnableToPerformHandshake {
                         source: TonicStatusError::from(e),
                     }
@@ -640,6 +641,7 @@ impl FlightClient {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    println!("Failed to receive trailer");
                     return Err(Error::UnableToPerformHandshake {
                         source: TonicStatusError::from(e),
                     });
