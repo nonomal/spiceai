@@ -379,8 +379,11 @@ impl SpiceTestQueryWorker {
                     })
                 } else {
                     eprintln!(
-                        "FAIL - Worker {} - Query '{}' failed: {}",
-                        self.id, query.name, e
+                        "{}, FAIL - Worker {} - Query '{}' failed: {}",
+                        chrono::Utc::now(),
+                        self.id,
+                        query.name,
+                        e
                     );
                     query_durations.entry(Arc::clone(&query.name)).or_default();
                     Ok(QueryRunResult {
@@ -421,8 +424,11 @@ impl SpiceTestQueryWorker {
                         validation_records.clear();
                     } else {
                         eprintln!(
-                            "FAIL - Worker {} - Query '{}' failed: {}",
-                            self.id, query.name, e
+                            "{} FAIL - Worker {} - Query '{}' failed: {}",
+                            chrono::Utc::now(),
+                            self.id,
+                            query.name,
+                            e
                         );
                         query_durations.entry(Arc::clone(&query.name)).or_default();
                         return Err(e.into());
