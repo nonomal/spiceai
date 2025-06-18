@@ -682,6 +682,8 @@ fn map_tonic_error_to_message(e: tonic::Status) -> Error {
 }
 
 pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
+    println!("tonic error debug print: {:?}", error);
+    println!("tonic error: {}", error);
     match error.code() {
         tonic::Code::Internal | tonic::Code::Cancelled => {
             let error_message = error.message().to_lowercase();
