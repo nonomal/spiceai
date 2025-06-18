@@ -19,7 +19,6 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::task::Poll;
 
-use arrow::array::PrimitiveRunBuilder;
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
@@ -618,38 +617,40 @@ impl FlightClient {
                 }
             })?;
 
-        // First Check Headers
         let mut token: Option<Token> = None;
-        if let Some(auth) = resp.metadata().get("authorization") {
-            let auth = auth
+
+        if let Some(grpc_status) = resp.metadata().get("grpc-status") {
+            let grpc_status = grpc_status
                 .to_str()
                 .context(UnableToConvertMetadataToStringSnafu)?;
-            token = Some(Token::new(&auth["Bearer ".len()..], true));
+            if grpc_status != "0" {
+                println!("Unexpected GRPC status: {grpc_status}");
+            }
         }
 
-        // If no token is found in headers, check trailers
-        if token.is_none() {
-            println!("Starting trailer authentication");
-            println!("Stream metadata: {:?}", resp.metadata());
-            let stream = resp.get_mut();
-
-            match stream.trailers().await {
-                Ok(Some(trailers)) => {
-                    if let Some(auth) = trailers.get("authorization") {
-                        let auth = auth
-                            .to_str()
-                            .context(UnableToConvertMetadataToStringSnafu)?;
-                        token = Some(Token::new(&auth["Bearer ".len()..], true));
-                    }
-                }
-                Ok(None) => {}
+        // Consume the response stream before reading the metadata
+        let stream = resp.get_mut();
+        while let Some(data) = stream.next().await {
+            match data {
+                Ok(_) => {}
                 Err(e) => {
-                    println!("Failed to receive trailer");
+                    if is_connection_reset_error(&e) {
+                        return Err(Error::ConnectionReset {
+                            source: TonicStatusError::from(e),
+                        });
+                    }
                     return Err(Error::UnableToPerformHandshake {
                         source: TonicStatusError::from(e),
                     });
                 }
             }
+        }
+
+        if let Some(auth) = resp.metadata().get("authorization") {
+            let auth = auth
+                .to_str()
+                .context(UnableToConvertMetadataToStringSnafu)?;
+            token = Some(Token::new(&auth["Bearer ".len()..], true));
         }
 
         Ok(token)
