@@ -19,6 +19,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::task::Poll;
 
+use arrow::array::PrimitiveRunBuilder;
 use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
@@ -629,6 +630,7 @@ impl FlightClient {
         // If no token is found in headers, check trailers
         if token.is_none() {
             println!("Starting trailer authentication");
+            println!("Stream metadata: {:?}", resp.metadata());
             let stream = resp.get_mut();
 
             match stream.trailers().await {
