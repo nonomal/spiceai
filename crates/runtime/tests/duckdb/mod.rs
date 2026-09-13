@@ -19,9 +19,10 @@ use std::sync::Arc;
 use crate::configure_test_datafusion;
 use crate::{
     RecordBatch, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
+use arrow::array::{Array, Float64Array};
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -63,6 +64,7 @@ fn make_test_query(table_name: &str) -> String {
 #[tokio::test]
 async fn duckdb_from_functions() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -114,7 +116,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -163,6 +165,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
 #[tokio::test]
 async fn duckdb_order_by_special_cases() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -191,7 +194,7 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -237,9 +240,9 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn duckdb_regexp() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -276,13 +279,50 @@ async fn duckdb_regexp() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
+
+            let regex_metachar_semantics = r"
+                WITH duckdb_regex AS (
+                    SELECT region FROM csv_test WHERE regexp_like(region, 'A.*A')
+                ), arrow_regex AS (
+                    SELECT region FROM csv_test_arrow WHERE regexp_like(region, 'A.*A')
+                ), missing_in_duckdb AS (
+                    SELECT region FROM arrow_regex
+                    EXCEPT
+                    SELECT region FROM duckdb_regex
+                ), missing_in_arrow AS (
+                    SELECT region FROM duckdb_regex
+                    EXCEPT
+                    SELECT region FROM arrow_regex
+                )
+                SELECT region FROM missing_in_duckdb
+                UNION ALL
+                SELECT region FROM missing_in_arrow
+            ";
+
+            let regex_semantic_diff: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(regex_metachar_semantics)
+                .build()
+                .run()
+                .await
+                .expect("regex metachar semantic comparison query is successful")
+                .data
+                .try_collect()
+                .await
+                .expect("collects regex metachar semantic comparison results");
+
+            assert_eq!(
+                regex_semantic_diff.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                0,
+                "regexp_like regex metacharacter semantics diverged between DuckDB and Arrow"
+            );
 
             let cases = vec![
                 (
@@ -362,12 +402,239 @@ async fn duckdb_regexp() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+async fn duckdb_json_functions() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let sample_csv_contents = include_str!("../test_data/json_data.csv");
+            let temp_file = NamedTempFile::new().expect("Should create temp file");
+            std::fs::write(temp_file.path(), sample_csv_contents)
+                .expect("failed to write sample file");
+
+            let app = AppBuilder::new("duckdb_json_test")
+                .with_dataset(make_duckdb_acceleration_dataset(
+                    "json_test",
+                    "csv",
+                    &format!("'{}'", temp_file.path().display()),
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let cases = vec![
+                (
+                    "test_json_get_str",
+                    "SELECT json_get_str(data, 'name') AS name FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_get_int",
+                    "SELECT json_get_int(data, 'age') AS age FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_get_float",
+                    "SELECT json_get_float(data, 'score') AS score FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_get_bool",
+                    "SELECT json_get_bool(data, 'active') AS active FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_contains",
+                    "SELECT json_contains(data, 'name') AS has_name FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_as_text",
+                    "SELECT json_as_text(data, 'name') AS name_text FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_length",
+                    "SELECT json_length(data, 'tags') AS tag_count FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_get_str_in_filter",
+                    "SELECT id FROM json_test WHERE json_get_str(data, 'name') = 'alice'",
+                ),
+            ];
+
+            for (name, query) in cases {
+                let result: Vec<RecordBatch> = rt
+                    .datafusion()
+                    .query_builder(query)
+                    .build()
+                    .run()
+                    .await
+                    .expect("query is successful")
+                    .data
+                    .try_collect()
+                    .await
+                    .expect("collects results");
+
+                let pretty = arrow::util::pretty::pretty_format_batches(&result)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))
+                    .expect("Should format batches");
+                insta::assert_snapshot!(format!("{name}_results"), pretty);
+
+                let explain_plan = rt
+                    .datafusion()
+                    .query_builder(&format!("EXPLAIN {query}"))
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("explain plan for `{query}` failed: {e}"))?
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("explain plan for `{query}` execution failed: {e}"))?;
+                let pretty = arrow::util::pretty::pretty_format_batches(&explain_plan)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))
+                    .expect("Should format batches");
+                insta::assert_snapshot!(format!("{name}_explain"), pretty);
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+/// Regression test for <https://github.com/spiceai/spiceai/issues/10703>.
+///
+/// The `DuckDB` *connector* (federation to `DuckDB`, no Spice acceleration) must
+/// not push Spice-only UDFs such as `json_get_str` into the SQL it sends to
+/// `DuckDB` — those functions don't exist in `DuckDB`, so the query fails with an
+/// "unknown function" error. Before the fix, `connector-duckdb` built its
+/// `DuckDBTableFactory` without the Spice function deny-list, so `DuckDB`'s
+/// `can_execute_plan` allowed the whole plan to federate and `json_get_str` was
+/// unparsed into the `DuckDB` SQL. With the deny-list installed, the projection
+/// is evaluated locally by `DataFusion` and only the bare scan is pushed down.
+#[tokio::test]
+async fn duckdb_connector_does_not_push_down_spice_functions() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let sample_csv_contents = include_str!("../test_data/json_data.csv");
+            let temp_file = NamedTempFile::new().expect("Should create temp file");
+            std::fs::write(temp_file.path(), sample_csv_contents)
+                .expect("failed to write sample file");
+
+            // No `.acceleration` — this exercises the connector federation path.
+            let app = AppBuilder::new("duckdb_connector_json_test")
+                .with_dataset(make_duckdb_dataset(
+                    "json_test",
+                    "csv",
+                    &format!("'{}'", temp_file.path().display()),
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let query = "SELECT json_get_str(data, 'name') AS name FROM json_test ORDER BY id";
+
+            // 1. The query must execute end-to-end. Before the fix this errored
+            //    because `json_get_str` was pushed to DuckDB, which rejects it.
+            let result: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("connector query `{query}` failed: {e}"))?
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("connector query `{query}` collect failed: {e}"))?;
+            assert_batches_eq!(
+                [
+                    "+---------+",
+                    "| name    |",
+                    "+---------+",
+                    "| alice   |",
+                    "| bob     |",
+                    "| charlie |",
+                    "+---------+",
+                ],
+                &result
+            );
+
+            // 2. The pushed-down DuckDB SQL must not contain `json_get_str`. Assert
+            //    on the `DuckSqlExec sql=` text directly so the test pins the actual
+            //    failure mode (federated SQL) rather than incidental formatting.
+            let explain_plan = rt
+                .datafusion()
+                .query_builder(&format!("EXPLAIN {query}"))
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("explain plan for `{query}` failed: {e}"))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| format!("explain plan for `{query}` execution failed: {e}"))?;
+            let pretty = arrow::util::pretty::pretty_format_batches(&explain_plan)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))
+                .expect("Should format batches");
+            let plan = pretty.to_string();
+
+            // With federation working the scan appears as VirtualExecutionPlan name=duckdb;
+            // on the scan fallback path it appears as DuckSqlExec. Either indicates that
+            // the DuckDB connector is being used for the table scan.
+            assert!(
+                plan.contains("name=duckdb") || plan.contains("DuckSqlExec"),
+                "expected the connector plan to push a scan down to DuckDB; plan was:\n{plan}"
+            );
+            // json_get_str must not appear in any SQL sent to DuckDB.
+            for line in plan
+                .lines()
+                .filter(|l| l.contains("DuckSqlExec sql=") || l.contains("base_sql="))
+            {
+                assert!(
+                    !line.contains("json_get_str"),
+                    "json_get_str was pushed into DuckDB SQL (deny-list not applied):\n{line}"
+                );
+            }
+            assert!(
+                plan.contains("json_get_str"),
+                "json_get_str must still appear in the plan, evaluated locally:\n{plan}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
 async fn test_duckdb_settings_persist() -> Result<(), String> {
     use spicepod::param::Params;
     use std::collections::HashMap;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -507,14 +774,14 @@ async fn test_duckdb_settings_persist() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_duckdb_all_settings() -> Result<(), String> {
     use spicepod::param::Params;
     use std::collections::HashMap;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
-    test_request_context()
+    Box::pin(test_request_context()
         .scope(async {
             // Test 1: Index scan settings with custom file
             println!("\n=== Test 1: Index Scan Settings with Custom File ===");
@@ -803,6 +1070,464 @@ async fn test_duckdb_all_settings() -> Result<(), String> {
             }
 
             println!("\n=== All DuckDB Settings Tests Passed ===");
+            Ok(())
+        }))
+        .await
+}
+
+/// Test that verifies `DuckDB` connection pool handles concurrent queries correctly.
+///
+/// **Critical for**: `duckdb-rs` fork (`spiceai/duckdb-rs`, spiceai-57)
+///
+/// This test exercises the connection pool improvements in the duckdb-rs fork by
+/// running multiple concurrent queries against a DuckDB-accelerated dataset.
+/// The connection pool must efficiently manage connections and avoid deadlocks
+/// or connection exhaustion under concurrent load.
+///
+/// **Patches tested**:
+/// - Connection pool improvements for memory allocation
+/// - Arrow 57 compatibility in duckdb-rs
+/// - `register_arrow_scan_view` method for arrow stream support
+///
+/// **What happens without the patch**: Concurrent queries may fail with connection
+/// errors, deadlocks, or memory issues due to inefficient connection handling.
+#[tokio::test]
+async fn test_duckdb_connection_pool_concurrent_queries() -> Result<(), String> {
+    use spicepod::param::Params;
+    use std::collections::HashMap;
+    use std::fmt::Write as _;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = std::env::temp_dir().join("spiced_duckdb_pool_test");
+            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+            defer! {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+            }
+
+            // Create a CSV file with more data for meaningful concurrent queries
+            let csv_file = temp_dir.join("test_concurrent.csv");
+            let mut csv_content = String::from("id,category,value\n");
+            for i in 1..=1000 {
+                let _ = writeln!(csv_content, "{},{},{}", i, ['A', 'B', 'C'][i % 3], i * 10);
+            }
+            std::fs::write(&csv_file, csv_content).expect("failed to write csv");
+
+            let mut accel_params = HashMap::new();
+            // Use memory mode for faster operations
+            accel_params.insert("duckdb_memory_limit".to_string(), "256MB".to_string());
+
+            let mut dataset = Dataset::new(
+                format!("file:{}", csv_file.display()),
+                "concurrent_test".to_string(),
+            );
+            dataset.name = "concurrent_test".to_string();
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Full),
+                params: Some(Params::from_string_map(accel_params)),
+                ..Acceleration::default()
+            });
+
+            let app = AppBuilder::new("duckdb_pool_test")
+                .with_dataset(dataset)
+                .build();
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Run multiple concurrent queries to test connection pool
+            let queries = [
+                "SELECT COUNT(*) FROM concurrent_test",
+                "SELECT category, SUM(value) FROM concurrent_test GROUP BY category",
+                "SELECT AVG(value) FROM concurrent_test WHERE category = 'A'",
+                "SELECT MAX(value), MIN(value) FROM concurrent_test",
+                "SELECT * FROM concurrent_test WHERE id < 100 ORDER BY id",
+                "SELECT category, COUNT(*) FROM concurrent_test GROUP BY category",
+                "SELECT value FROM concurrent_test WHERE value > 5000 ORDER BY value DESC LIMIT 10",
+                "SELECT DISTINCT category FROM concurrent_test ORDER BY category",
+            ];
+
+            let num_iterations = 3;
+            let mut handles = Vec::new();
+
+            for iteration in 0..num_iterations {
+                for (i, query) in queries.iter().enumerate() {
+                    let rt_clone = Arc::clone(&rt);
+                    let query = (*query).to_string();
+                    let handle = tokio::spawn(async move {
+                        let result = rt_clone
+                            .datafusion()
+                            .query_builder(&query)
+                            .build()
+                            .run()
+                            .await;
+
+                        match result {
+                            Ok(query_result) => {
+                                let batches: Result<Vec<RecordBatch>, _> =
+                                    query_result.data.try_collect().await;
+                                match batches {
+                                    Ok(b) => {
+                                        tracing::debug!(
+                                            "Query {}-{} completed: {} batches",
+                                            iteration,
+                                            i,
+                                            b.len()
+                                        );
+                                        Ok(())
+                                    }
+                                    Err(e) => {
+                                        Err(format!("Query {iteration}-{i} collection failed: {e}"))
+                                    }
+                                }
+                            }
+                            Err(e) => Err(format!("Query {iteration}-{i} execution failed: {e}")),
+                        }
+                    });
+                    handles.push(handle);
+                }
+            }
+
+            // Wait for all concurrent queries to complete
+            let results: Vec<_> = futures::future::join_all(handles).await;
+
+            // Check for any failures
+            let mut errors = Vec::new();
+            for (i, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => errors.push(format!("Task {i}: {e}")),
+                    Err(e) => errors.push(format!("Task {i} panicked: {e}")),
+                }
+            }
+
+            if !errors.is_empty() {
+                return Err(format!(
+                    "DuckDB connection pool test FAILED - {} queries failed out of {}:\n{}",
+                    errors.len(),
+                    num_iterations * queries.len(),
+                    errors.join("\n")
+                ));
+            }
+
+            tracing::info!(
+                "DuckDB connection pool test PASSED - {} concurrent queries completed successfully",
+                num_iterations * queries.len()
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// A Parquet file written with an all-null column has `DataType::Null` in its Arrow schema
+/// metadata (logical type Unknown). `DuckDB` doesn't have a Null type and silently coerces
+/// it to INT32 when creating the acceleration table. Without the fix this produces a schema
+/// mismatch at query time; with the fix the accelerator normalises the column to INT32 before
+/// creating the table so both sides agree.
+#[tokio::test]
+async fn duckdb_acceleration_null_typed_parquet_column() -> Result<(), String> {
+    use arrow::array::{Int64Array, NullArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::parquet::arrow::ArrowWriter;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            // Build a parquet file whose `untyped` column carries DataType::Null — the same
+            // situation as a pyarrow file where every value in a column is null and the
+            // column was never given an explicit type.
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("untyped", DataType::Null, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(NullArray::new(3)),
+                ],
+            )
+            .map_err(|e| format!("failed to create batch: {e}"))?;
+
+            let temp_dir =
+                tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+            let parquet_path = temp_dir.path().join("null_col.parquet");
+            {
+                let file = std::fs::File::create(&parquet_path)
+                    .map_err(|e| format!("failed to create parquet file: {e}"))?;
+                let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
+                    .map_err(|e| format!("failed to create ArrowWriter: {e}"))?;
+                writer
+                    .write(&batch)
+                    .map_err(|e| format!("failed to write batch: {e}"))?;
+                writer
+                    .close()
+                    .map_err(|e| format!("failed to close writer: {e}"))?;
+            }
+
+            let mut dataset = Dataset::new(
+                format!("duckdb:read_parquet('{}')", parquet_path.display()),
+                "null_col_parquet".to_string(),
+            );
+            dataset.name = "null_col_parquet".to_string();
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Full),
+                ..Acceleration::default()
+            });
+
+            let app = AppBuilder::new("duckdb_null_col_test")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err("Timed out waiting for dataset to load".to_string());
+                }
+                () = Arc::clone(&cloned_rt).load_components() => {}
+            }
+
+            runtime_ready_check(&cloned_rt).await;
+
+            let result = cloned_rt
+                .datafusion()
+                .query_builder("SELECT id, untyped FROM null_col_parquet ORDER BY id")
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query failed: {e}"))?;
+
+            let batches: Vec<RecordBatch> = result
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("failed to collect results: {e}"))?;
+
+            assert_batches_eq!(
+                [
+                    "+----+---------+",
+                    "| id | untyped |",
+                    "+----+---------+",
+                    "| 1  |         |",
+                    "| 2  |         |",
+                    "| 3  |         |",
+                    "+----+---------+",
+                ],
+                &batches
+            );
+
+            let result = cloned_rt
+                .datafusion()
+                .query_builder("describe null_col_parquet")
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query failed: {e}"))?;
+
+            let batches: Vec<RecordBatch> = result
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("failed to collect results: {e}"))?;
+
+            assert_batches_eq!(
+                [
+                    "+-------------+-----------+-------------+",
+                    "| column_name | data_type | is_nullable |",
+                    "+-------------+-----------+-------------+",
+                    "| id          | Int64     | YES         |",
+                    "| untyped     | Int32     | YES         |",
+                    "+-------------+-----------+-------------+",
+                ],
+                &batches
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A federated `inner_product` must answer what the kernel answers for a row
+/// whose dot product is not a finite number. (Finite results are a separate,
+/// unclosed question — #13893 — so this asserts only the non-finite contract.)
+///
+/// `array_inner_product` hands back the `inf` or `nan` it computed, where
+/// Spice's kernel calls an undefined dot product NULL — and `DuckDB` sorts
+/// `nan` above every real number under `ORDER BY … DESC`, so a vector the
+/// kernel drops as undefined became the top row of every federated query
+/// (issue #13787). The dialect now screens the pushed-down call with
+/// `isfinite`.
+///
+/// The `EXPLAIN` assertion is the half a unit test cannot reach: it pins that
+/// the screen is in the SQL `DuckDB` actually receives, rather than an
+/// expression the runtime happened to evaluate locally.
+#[tokio::test]
+async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            // A TempDir rather than a NamedTempFile: `duckdb::Connection::open`
+            // wants to create the database itself, and the directory guard is
+            // what removes it (and DuckDB's `.wal` sidecar) when the test ends.
+            let db_dir = tempfile::tempdir().expect("should create temp dir");
+            let db_path = db_dir.path().join("vecs.db");
+
+            {
+                let conn = duckdb::Connection::open(&db_path)
+                    .map_err(|e| format!("failed to open duckdb file: {e}"))?;
+                conn.execute_batch(
+                    "CREATE TABLE vecs (id INTEGER, emb FLOAT[3], q FLOAT[3]);
+                     INSERT INTO vecs VALUES
+                       (1, [1.0, 2.0, 3.0]::FLOAT[3],        [4.0, 5.0, 6.0]::FLOAT[3]),
+                       (2, [1e20, 0.0, 0.0]::FLOAT[3],       [1e20, 0.0, 0.0]::FLOAT[3]),
+                       (3, ['nan'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
+                       (4, ['inf'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
+                       (5, ['-inf'::FLOAT, 1.0, 1.0]::FLOAT[3], [1.0, 1.0, 1.0]::FLOAT[3]),
+                       (6, [0.0, 0.0, 0.0]::FLOAT[3],        [1.0, 2.0, 3.0]::FLOAT[3]);",
+                )
+                .map_err(|e| format!("failed to seed duckdb file: {e}"))?;
+            }
+
+            let mut dataset = Dataset::new("duckdb:vecs", "vecs");
+            // `duckdb_open`, not `duckdb_file`: the latter is the accelerator's
+            // parameter, and the connector ignores it with a warning and then
+            // fails to load the dataset for want of a database to open.
+            dataset.params = Some(spicepod::param::Params::from_string_map(
+                vec![("duckdb_open".to_string(), db_path.display().to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+
+            let app = AppBuilder::new("duckdb_inner_product_non_finite")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let query = "SELECT id, inner_product(emb, q) AS ip FROM vecs ORDER BY id";
+            let result: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query `{query}` failed: {e}"))?
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("query `{query}` collect failed: {e}"))?;
+
+            // Rows 2-5 overflow or carry a non-finite element; the kernel calls
+            // each of those undefined, so the federated answer must be NULL too.
+            // Rows 1 and 6 are ordinary and must survive the screen.
+            //
+            // Both infinities are rows because they fail a screen in opposite
+            // directions: `-inf` sorts below every real number under `ORDER BY
+            // … DESC`, so it never surfaced as the top row that made #13787
+            // visible, and an upper-bound screen would reject `+inf` while
+            // letting `-inf` through.
+            //
+            // Asserted per value rather than against a rendered table: a NULL
+            // and a `nan` are both blank in the pretty-printed form, which is
+            // exactly the difference this test exists to catch.
+            let expected = vec![Some(32.0_f64), None, None, None, None, Some(0.0_f64)];
+            let scores: Vec<Option<f64>> = result
+                .iter()
+                .flat_map(|batch| {
+                    let scores = batch
+                        .column_by_name("ip")
+                        .expect("result carries an `ip` column")
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .expect("`ip` is the kernel's Float64 return type")
+                        .clone();
+                    (0..scores.len())
+                        .map(|row| (!scores.is_null(row)).then(|| scores.value(row)))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                scores, expected,
+                "a federated inner_product must match the kernel wherever the result \
+                 is not a finite number: NULL for the overflow (id 2), the NaN \
+                 element (id 3) and the positive and negative infinite elements \
+                 (ids 4 and 5). Finite results are not claimed to agree exactly \
+                 — see #13893"
+            );
+
+            let explain: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(&format!("EXPLAIN {query}"))
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("explain for `{query}` failed: {e}"))?
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("explain for `{query}` collect failed: {e}"))?;
+            let plan = arrow::util::pretty::pretty_format_batches(&explain)
+                .map_err(|e| format!("failed to format explain: {e}"))?
+                .to_string();
+
+            let federated_sql: Vec<&str> = plan
+                .lines()
+                .filter(|line| line.contains("base_sql=") || line.contains("DuckSqlExec sql="))
+                .collect();
+            assert!(
+                !federated_sql.is_empty(),
+                "expected the scan to be pushed down to DuckDB; plan was:\n{plan}"
+            );
+            for line in federated_sql {
+                assert!(
+                    line.contains("array_inner_product"),
+                    "inner_product must still push down to DuckDB:\n{line}"
+                );
+                assert!(
+                    line.contains("isfinite"),
+                    "the pushed-down inner_product must be screened by isfinite, so a \
+                     non-finite result comes back NULL rather than topping the ranking:\n{line}"
+                );
+            }
+
             Ok(())
         })
         .await

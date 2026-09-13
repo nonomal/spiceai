@@ -33,7 +33,7 @@ use datafusion::{
         DFSchemaRef,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
-    error::Result,
+    error::{DataFusionError, Result},
     execution::SendableRecordBatchStream,
     logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
     optimizer::{OptimizerConfig, OptimizerRule},
@@ -44,7 +44,7 @@ use datafusion::{
 };
 use futures::StreamExt;
 
-use crate::pass_thru::PassThruExec;
+use crate::{Error, pass_thru::PassThruExec};
 
 /// [`OptimizerRule`] that detects write operations in a `DataFusion` logical plan and injects a cache invalidation node [`CacheInvalidationNode`].
 ///
@@ -170,11 +170,28 @@ impl UserDefinedLogicalNodeCore for CacheInvalidationNode {
     }
 
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
-        assert_eq!(inputs.len(), 1, "should have one input");
-        assert_eq!(exprs.len(), 0, "should have no expressions");
+        if inputs.len() != 1 {
+            return Err(DataFusionError::External(
+                Error::InvalidInputCount {
+                    input_len: inputs.len(),
+                }
+                .into(),
+            ));
+        }
+
+        if !exprs.is_empty() {
+            return Err(DataFusionError::External(
+                Error::InvalidExpressionCount {
+                    expr_len: exprs.len(),
+                }
+                .into(),
+            ));
+        }
+
         let Some(input) = inputs.into_iter().next() else {
             unreachable!("should have one input");
         };
+
         Ok(Self {
             input,
             table: self.table.clone(),
@@ -234,7 +251,7 @@ fn create_cache_invalidation_exec(
                 }
             }
             if ok {
-                invalidate_cache_for_table(&table, &caching);
+                invalidate_cache_for_table(&table, &caching).await;
             }
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, s)) as SendableRecordBatchStream)
@@ -257,9 +274,9 @@ fn create_cache_invalidation_exec(
     )
 }
 
-fn invalidate_cache_for_table(table: &TableReference, caching: &Weak<Caching>) {
+async fn invalidate_cache_for_table(table: &TableReference, caching: &Weak<Caching>) {
     if let Some(cache) = caching.upgrade() {
-        if let Err(e) = cache.invalidate_for_table(table.clone()) {
+        if let Err(e) = cache.invalidate_for_table(table.clone()).await {
             tracing::warn!("Failed to invalidate cache for table {table}: {e}");
         } else {
             tracing::trace!("Successfully invalidated cache for table {table}");

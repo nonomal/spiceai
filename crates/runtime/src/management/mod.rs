@@ -18,6 +18,7 @@ const TASK_HISTORY_SINK_REMOTE_TABLE: &str = "runtime.task_history";
 const TASK_HISTORY_SINK_TABLE: &str = "scp.task_history";
 const DEFAULT_EXPORT_INTERVAL_SECS: u64 = 5;
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -64,7 +65,9 @@ pub enum Error {
     #[snafu(display("Missing required secret: {name}. Specify a value."))]
     MissingRequiredSecret { name: String },
 
-    #[snafu(display("Table provider does not support read_write mode"))]
+    #[snafu(display(
+        "Dataset does not support read-write mode. Ensure the acceleration engine supports writes."
+    ))]
     NoReadWriteProvider {},
 
     #[snafu(display(
@@ -74,10 +77,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Sync + Send>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to create data connector for cloud management: {source}"))]
     UnableToCreateCloudTableProvider { source: DataConnectorError },
 
-    #[snafu(display("Error exporting task_history records: {source}"))]
+    #[snafu(display("Failed to export runtime task history records: {source}"))]
     UnableToExportTaskHistoryData {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -204,6 +207,13 @@ impl Management {
             );
         }
 
+        if let Some(region) = self.params.get("region") {
+            params.insert(
+                "spiceai_region".to_string(),
+                region.expose_secret().to_string(),
+            );
+        }
+
         let sink = get_spiceai_table_provider(
             TASK_HISTORY_SINK_TABLE,
             TASK_HISTORY_SINK_REMOTE_TABLE,
@@ -222,7 +232,7 @@ impl Management {
     // Calculate the timestamp for 3 days ago from now
     fn calculate_export_since_time() -> SystemTime {
         SystemTime::now()
-            .checked_sub(Duration::from_secs(3 * 24 * 60 * 60))
+            .checked_sub(Duration::from_hours(72))
             .unwrap_or(SystemTime::UNIX_EPOCH)
     }
 
@@ -275,6 +285,7 @@ async fn get_spiceai_table_provider(
     };
 
     let secrets = runtime.secrets();
+    let tokio_io_runtime = runtime.tokio_io_runtime();
 
     let mut dataset = DatasetBuilder::try_new(format!("spice.ai/{cloud_dataset_path}"), name)
         .boxed()
@@ -288,18 +299,19 @@ async fn get_spiceai_table_provider(
 
     dataset.access = AccessMode::ReadWrite;
 
-    let params = ConnectorParamsBuilder::new("spice.ai".into(), (&dataset).into())
-        .build(secrets)
+    let params = ConnectorParamsBuilder::for_dataset("spice.ai".into(), &dataset)
+        .build(secrets, tokio_io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 
-    let data_connector = create_new_connector("spice.ai", params)
+    let context = RuntimeConnectorContext::for_dataset(&dataset);
+    let data_connector = create_new_connector("spice.ai", params, &context)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateDataConnectorSnafu)?;
 
     let source_table_provider = data_connector
-        .read_write_provider(&dataset)
+        .read_write_provider(&context, &dataset)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateCloudTableProviderSnafu)?;
@@ -392,7 +404,7 @@ fn is_table_not_ready_error(e: &DataFusionError) -> bool {
 
 // Resolve a secret by key, returning the secret string if found, or the original key if not.
 async fn resolve_secret(secrets: &Arc<RwLock<Secrets>>, key: &str) -> SecretString {
-    let secrets = secrets.read().await;
+    let secrets = Secrets::snapshot(secrets).await;
     if let Ok(Some(secret)) = secrets.get_secret(key).await {
         secret
     } else {

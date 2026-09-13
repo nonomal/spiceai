@@ -15,8 +15,6 @@ limitations under the License.
 */
 
 use datafusion::sql::TableReference;
-use opentelemetry::trace::TraceId;
-use rand::RngCore;
 
 use crate::{
     component::dataset::{
@@ -34,7 +32,7 @@ pub fn dataset_registered_trace(
     ds: &Dataset,
     results_cache_enabled: bool,
 ) -> String {
-    let mut info = format!("Dataset {} registered ({})", &ds.name, &ds.from);
+    let mut info = format!("Dataset {} registered ({})", ds.name, ds.from);
     if let Some(acceleration) = &ds.acceleration
         && acceleration.enabled
     {
@@ -80,7 +78,10 @@ fn acceleration_info(
 ) -> String {
     let mut info: String = acceleration.engine.to_string();
 
-    if acceleration.mode == Mode::File {
+    if matches!(
+        acceleration.mode,
+        Mode::File | Mode::FileCreate | Mode::FileUpdate
+    ) {
         info.push_str(":file");
     }
 
@@ -98,6 +99,12 @@ fn acceleration_info(
         RefreshMode::Changes => {
             info.push_str(", changes");
         }
+        RefreshMode::Caching => {
+            info.push_str(", caching");
+        }
+        RefreshMode::Snapshot => {
+            info.push_str(", snapshot");
+        }
     }
 
     if let Some(refresh_interval) = &acceleration.refresh_check_interval {
@@ -114,22 +121,10 @@ fn acceleration_info(
     info
 }
 
-pub fn random_trace_id() -> TraceId {
-    let mut bytes = [0u8; 16];
-    let mut rng = rand::rng();
-    rng.fill_bytes(&mut bytes);
-
-    // Ensure the TraceId is not all zeros
-    if bytes.iter().all(|&b| b == 0) {
-        return random_trace_id();
-    }
-
-    TraceId::from_bytes(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetSpec;
     use crate::component::dataset::acceleration::Engine;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::DataConnectorResult;
@@ -150,7 +145,8 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!()
         }

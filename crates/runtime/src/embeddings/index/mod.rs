@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "duckdb")]
+pub mod duckdb;
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch;
 #[cfg(feature = "s3_vectors")]
 pub mod s3;
-pub(crate) mod scan_table;
-pub use scan_table::VectorScanTableProvider;
+pub mod table;
 
 #[cfg(test)]
 pub mod tests {
@@ -44,12 +47,12 @@ pub mod tests {
         sql::TableReference,
     };
     use datafusion_expr::{LogicalPlan, TableScan};
-    use runtime_datafusion_index::Index;
     use search::index::VectorIndex;
-    use search::{generation::util::append_fields, index::SearchIndex};
+    use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex};
     use snafu::ResultExt;
+    use spice_table::Index;
 
-    use crate::embedding_col;
+    use runtime_search::embedding_col;
 
     /// This is just a [`MemTable`] that pretends it can support all filter pushdowns.
     /// This is useful for testing explain plans.
@@ -77,11 +80,7 @@ pub mod tests {
             self.4
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
             self.0.properties()
         }
 
@@ -136,10 +135,6 @@ pub mod tests {
 
     #[async_trait]
     impl TableProvider for ExplainMemTable {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.0.schema()
         }
@@ -265,7 +260,11 @@ pub mod tests {
         fn query_table_provider(&self, _query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
             let schema = append_fields(
                 &Arc::new(self.schema.clone()),
-                vec![Arc::new(Field::new("score", DataType::Float64, false))],
+                vec![Arc::new(Field::new(
+                    SEARCH_SCORE_COLUMN_NAME,
+                    DataType::Float64,
+                    false,
+                ))],
             );
             Ok(LogicalPlan::TableScan(TableScan::try_new(
                 "explain",
@@ -314,7 +313,7 @@ pub mod tests {
         Ok(())
     }
 
-    #[allow(
+    #[expect(
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
         clippy::missing_panics_doc
@@ -340,7 +339,7 @@ pub mod tests {
                     *length,
                 );
                 Arc::new(FixedSizeListArray::from(
-                    ArrayData::builder(list_data_type.clone())
+                    ArrayData::builder(list_data_type)
                         .len(1)
                         .add_child_data(
                             ArrayData::builder(DataType::Float32)
@@ -362,7 +361,7 @@ pub mod tests {
     }
 
     /// Creates a [`RecordBatch`] with a single row that has default value of types, as per the [`Schema`].
-    #[allow(clippy::missing_panics_doc)]
+    #[expect(clippy::missing_panics_doc)]
     #[must_use]
     pub fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
         let arrays: Vec<ArrayRef> = schema

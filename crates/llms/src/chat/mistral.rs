@@ -14,31 +14,35 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::chat::message_to_mistral;
+use crate::chat::{LocalModelOptions, PagedAttentionMode, message_to_mistral};
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice,
         ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionTool, ChatCompletionToolChoiceOption,
-        ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role, Stop,
+        ChatCompletionStreamResponseDelta, ChatCompletionToolChoiceOption, ChatCompletionTools,
+        CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
+        FunctionCallStream, FunctionType, Role, StopConfiguration, ToolChoiceOptions,
     },
 };
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
+use mistralrs::core::{
+    AdapterPaths, AutoDeviceMapParams, DeviceMapSetting, GGMLLoaderBuilder, GGMLSpecificConfig,
+    GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
+    ModelPaths, MultimodalLoaderBuilder, MultimodalLoaderType, MultimodalSpecificConfig,
+    NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, Pipeline, RequestMessage,
+    TokenSource,
+};
 use mistralrs::{
-    AdapterPaths, AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse,
-    ChunkChoice, Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder,
-    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs,
-    MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
-    Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
-    TokenSource, Tool, ToolCallResponse, ToolChoice, ToolType,
+    ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device, Function,
+    ModelDType, NormalRequest, Request as MistralRequest, Response as MistralResponse,
+    SamplingParams, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
 use secrecy::{ExposeSecret, SecretString};
@@ -56,16 +60,27 @@ use std::{
 };
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
+/// Preserve the existing local LLM scheduler concurrency. Paged attention uses
+/// the same cap so enabling cache-aware scheduling does not change request parallelism.
+const LOCAL_LLM_MAX_SEQS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4);
+
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
     counter: AtomicUsize,
+    /// RAII drop guard that keeps the per-node `RING_CONFIG` temp file alive for
+    /// the model's lifetime (its `Drop` deletes the file on model teardown).
+    /// `None` for single-node models. Never read directly.
+    #[expect(dead_code)]
+    ring_config: Option<tempfile::TempPath>,
 }
 
 fn to_openai_response(
     resp: &ChatCompletionResponse,
 ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-    let resp_str = serde_json::to_string(resp)?;
-    serde_json::from_str(&resp_str).map_err(OpenAIError::from)
+    let resp_str = serde_json::to_string(resp)
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to serialize response: {e}")))?;
+    serde_json::from_str(&resp_str)
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to deserialize response: {e}")))
 }
 
 impl MistralLlama {
@@ -75,8 +90,14 @@ impl MistralLlama {
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
-        chat_template_literal: Option<&str>,
+        options: LocalModelOptions<'_>,
+        ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
+        let LocalModelOptions {
+            chat_template_literal,
+            context_length,
+            paged_attention,
+        } = options;
         for weight in model_weights {
             if !weight.exists() {
                 return Err(ChatError::LocalModelNotFound {
@@ -127,17 +148,45 @@ impl MistralLlama {
             .and_then(|p| p.as_path().extension())
             .and_then(|e| e.to_str());
 
+        let paged_attn_config = match paged_attention {
+            PagedAttentionMode::Disabled => {
+                tracing::info!(
+                    "Serving model {model_id} with dense attention (paged_attention: disabled)"
+                );
+                None
+            }
+            PagedAttentionMode::Auto => Self::paged_attention_config(&device),
+        };
+        let device_map = DeviceMapSetting::Auto(Self::text_device_map_params(context_length));
+        let paged_attn_requested = paged_attn_config.is_some();
         let pipeline = match extension {
-            Some("ggml") => {
-                Self::load_ggml_pipeline(paths, &device, &model_id, chat_template_literal)?
-            }
-            Some("gguf") => {
-                Self::load_gguf_pipeline(paths, &device, &model_id, chat_template_literal)?
-            }
-            _ => Self::load_default_pipeline(paths, &device, &model_id, chat_template_literal)?,
+            Some("ggml") => Self::load_ggml_pipeline(
+                paths,
+                &device,
+                &model_id,
+                chat_template_literal,
+                device_map,
+                paged_attn_config,
+            )?,
+            Some("gguf") => Self::load_gguf_pipeline(
+                paths,
+                &device,
+                &model_id,
+                chat_template_literal,
+                device_map,
+                paged_attn_config,
+            )?,
+            _ => Self::load_default_pipeline(
+                paths,
+                &device,
+                &model_id,
+                chat_template_literal,
+                device_map,
+                paged_attn_config,
+            )?,
         };
 
-        Ok(Self::from_pipeline(pipeline).await)
+        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path).await)
     }
 
     /// Create paths object, [`ModelPaths`], to create new [`MistralLlama`].
@@ -154,17 +203,24 @@ impl MistralLlama {
         tokenizer_config: Option<&Path>,
         generation_config: Option<&Path>,
     ) -> Box<dyn ModelPaths> {
-        Box::new(LocalModelPaths::new(
-            tokenizer.map(Into::into).unwrap_or_default(),
-            config.map(Into::into).unwrap_or_default(),
-            tokenizer_config.map(Into::into),
-            model_weights.iter().map(Into::into).collect(),
-            AdapterPaths::None,
-            generation_config.map(Into::into),
-            None,
-            None,
-            None,
-        ))
+        // NOTE: `LocalModelPaths::new` wraps its 3rd arg (`template_filename`) in `Some`,
+        // so passing an empty `PathBuf` (GGUF models carry no `tokenizer_config`) yields
+        // `Some("")`, which panics in mistral.rs `get_chat_template` (`.extension()` on an
+        // empty path -> "Template filename must be a file"). Construct the struct directly
+        // so `template_filename` is `None` when absent: GGUF models then fall back to the
+        // chat template embedded in the GGUF metadata. A present `tokenizer_config`
+        // (safetensors) is still used as the template source, preserving prior behavior.
+        Box::new(LocalModelPaths {
+            tokenizer_filename: tokenizer.map(PathBuf::from).unwrap_or_default(),
+            config_filename: config.map(PathBuf::from).unwrap_or_default(),
+            template_filename: tokenizer_config.map(PathBuf::from),
+            filenames: model_weights.to_vec(),
+            adapter_paths: AdapterPaths::None,
+            gen_conf: generation_config.map(PathBuf::from),
+            preprocessor_config: None,
+            processor_config: None,
+            chat_template_json_filename: None,
+        })
     }
 
     fn load_default_pipeline(
@@ -172,10 +228,12 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        device_map: DeviceMapSetting,
+        paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
         NormalLoaderBuilder::new(
-            mistralrs::NormalSpecificConfig::default(),
+            NormalSpecificConfig::default(),
             chat_template_literal.map(ToString::to_string),
             None,
             model_parts.first().map(ToString::to_string),
@@ -189,9 +247,9 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            device_map,
             None,
-            None,
+            paged_attn_config,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
@@ -201,6 +259,8 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        device_map: DeviceMapSetting,
+        paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         // Note: GGUF supports chat templates in the file, but since GGML/llama.cpp does
         // not write them into GGUF with their conversions, often it requires user
@@ -248,9 +308,9 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            device_map,
             None,
-            None,
+            paged_attn_config,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
@@ -260,6 +320,8 @@ impl MistralLlama {
         device: &Device,
         model_id: &str,
         chat_template_literal: Option<&str>,
+        device_map: DeviceMapSetting,
+        paged_attn_config: Option<mistralrs::PagedAttentionConfig>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let tokenizer = paths.get_tokenizer_filename().to_string_lossy().to_string();
         GGMLLoaderBuilder::new(
@@ -278,11 +340,76 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+            device_map,
             None,
-            None,
+            paged_attn_config,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
+    }
+
+    /// Build the mistral.rs `PagedAttention` config for a locally served model, or `None`
+    /// where this build cannot use it.
+    ///
+    /// Requesting it is all a caller can do: the engine downgrades to dense attention for
+    /// architectures with no paged kernel (the Multi-head Latent Attention GGUFs), which
+    /// is knowledge that belongs with its loaders rather than here.
+    fn paged_attention_config(device: &Device) -> Option<mistralrs::PagedAttentionConfig> {
+        if matches!(device, Device::Cpu) || !Self::paged_attention_supported() {
+            return None;
+        }
+
+        match mistralrs::PagedAttentionMetaBuilder::default().build() {
+            Ok(config) => Some(config),
+            Err(e) => {
+                tracing::warn!("Failed to initialize local LLM paged attention cache: {e}");
+                None
+            }
+        }
+    }
+
+    fn paged_attention_supported() -> bool {
+        cfg!(all(feature = "cuda", target_family = "unix"))
+    }
+
+    /// Auto device-map params for text models, honoring an optional operator-set context
+    /// length (the `context_length` model param); the engine's own default applies when
+    /// unset. This is the sequence-length budget used to plan cross-device layer placement
+    /// and size the KV reservation — it does not raise the context the weights were
+    /// trained for, which the model's own metadata still caps.
+    fn text_device_map_params(context_length: Option<usize>) -> AutoDeviceMapParams {
+        context_length.map_or_else(AutoDeviceMapParams::default_text, |max_seq_len| {
+            AutoDeviceMapParams::Text {
+                max_seq_len,
+                max_batch_size: AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE,
+            }
+        })
+    }
+
+    fn default_scheduler_config() -> mistralrs::SchedulerConfig {
+        mistralrs::SchedulerConfig::DefaultScheduler {
+            method: mistralrs::DefaultSchedulerMethod::Fixed(LOCAL_LLM_MAX_SEQS),
+        }
+    }
+
+    async fn scheduler_config(
+        pipeline: &Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
+        paged_attn_requested: bool,
+    ) -> mistralrs::SchedulerConfig {
+        if paged_attn_requested {
+            let cache_config = pipeline.lock().await.get_metadata().cache_config.clone();
+            if let Some(config) = cache_config {
+                return mistralrs::SchedulerConfig::PagedAttentionMeta {
+                    max_num_seqs: LOCAL_LLM_MAX_SEQS.get(),
+                    config,
+                };
+            }
+
+            tracing::debug!(
+                "Paged attention was requested for local LLM caching, but the model did not initialize paged cache metadata. Falling back to the default scheduler."
+            );
+        }
+
+        Self::default_scheduler_config()
     }
 
     /// Get the device to use for the model.
@@ -307,50 +434,86 @@ impl MistralLlama {
         arch: Option<&str>,
         hf_token_literal: Option<&SecretString>,
         gguf_filename: Option<PathBuf>,
+        chat_template_literal: Option<&str>,
+        ring_config_path: Option<tempfile::TempPath>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
+        let chat_template = chat_template_literal.map(ToString::to_string);
 
         // Loading the GGUF directly (as if it is a quantized model, although it need not be quantized).
-        let loader: Result<Box<dyn Loader>> = if let Some(gguf) = gguf_filename {
-            Ok(GGUFLoaderBuilder::new(
-                None,
-                None,
-                model_parts[0].to_string(),
-                vec![gguf.to_string_lossy().to_string()],
-                GGUFSpecificConfig::default(),
-                false,
-                None,
-            )
-            .build())
-        } else {
-            // Hardcoded model architecture can ensure correct loading type.
-            // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
-            let loader_type = arch
-                .map(|a| {
-                    mistralrs::NormalLoaderType::from_str(a)
-                        .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
-                })
-                .transpose()?;
+        let (loader, device_map_params): (Result<Box<dyn Loader>>, AutoDeviceMapParams) =
+            if let Some(gguf) = gguf_filename {
+                (
+                    Ok(GGUFLoaderBuilder::new(
+                        chat_template.clone(),
+                        None,
+                        model_parts[0].to_string(),
+                        vec![gguf.to_string_lossy().to_string()],
+                        GGUFSpecificConfig::default(),
+                        false,
+                        None,
+                    )
+                    .build()),
+                    AutoDeviceMapParams::default_text(),
+                )
+            } else {
+                // Hardcoded model architecture can ensure correct loading type.
+                // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`).
+                // Try the text (Normal) loader types first; if the architecture is unknown to that
+                // enum, fall back to the multimodal loader (e.g. Gemma 4, Gemma 3, Qwen2-VL, ...).
+                let normal_loader_type = arch
+                    .map(NormalLoaderType::from_str)
+                    .transpose()
+                    .ok()
+                    .flatten();
 
-            let builder = NormalLoaderBuilder::new(
-                mistralrs::NormalSpecificConfig::default(),
-                None,
-                None,
-                Some(model_parts[0].to_string()),
-                false,
-                None,
-            );
+                if arch.is_some() && normal_loader_type.is_none() {
+                    let multimodal_loader_type = arch
+                        .map(|a| {
+                            MultimodalLoaderType::from_str(a)
+                                .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
+                        })
+                        .transpose()?;
 
-            builder
-                .build(loader_type)
-                .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
-        };
+                    let builder = MultimodalLoaderBuilder::new(
+                        MultimodalSpecificConfig::default(),
+                        chat_template,
+                        None,
+                        Some(model_parts[0].to_string()),
+                        None,
+                    );
+
+                    (
+                        Ok(builder.build(multimodal_loader_type)),
+                        AutoDeviceMapParams::default_multimodal(),
+                    )
+                } else {
+                    let builder = NormalLoaderBuilder::new(
+                        NormalSpecificConfig::default(),
+                        chat_template,
+                        None,
+                        Some(model_parts[0].to_string()),
+                        false,
+                        None,
+                    );
+
+                    (
+                        builder
+                            .build(normal_loader_type)
+                            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() }),
+                        AutoDeviceMapParams::default_text(),
+                    )
+                }
+            };
 
         let device = Self::get_device();
         let token_source = hf_token_literal.map_or(TokenSource::CacheToken, |secret| {
             tracing::debug!("A HuggingFace token was specified in parameters. The specified token will be used instead of any system/environment defaults.");
             TokenSource::Literal(secret.expose_secret().to_string())
         });
+
+        let paged_attn_config = Self::paged_attention_config(&device);
+        let paged_attn_requested = paged_attn_config.is_some();
 
         let pipeline = loader?
             .load_model_from_hf(
@@ -359,31 +522,27 @@ impl MistralLlama {
                 &ModelDType::Auto,
                 &device,
                 false,
-                DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
+                DeviceMapSetting::Auto(device_map_params),
                 None,
-                None,
+                paged_attn_config,
             )
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?;
 
-        Ok(Self::from_pipeline(pipeline).await)
+        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path).await)
     }
 
-    #[allow(clippy::expect_used)]
-    async fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Self {
+    async fn from_pipeline(
+        pipeline: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
+        paged_attn_requested: bool,
+        ring_config: Option<tempfile::TempPath>,
+    ) -> Self {
+        let scheduler_config = Self::scheduler_config(&pipeline, paged_attn_requested).await;
         Self {
-            pipeline: MistralRsBuilder::new(
-                p,
-                mistralrs::SchedulerConfig::DefaultScheduler {
-                    method: mistralrs::DefaultSchedulerMethod::Fixed(
-                        NonZeroUsize::new(5).expect("unreachable 5 > 0"),
-                    ),
-                },
-                false,
-                None,
-            )
-            .build()
-            .await,
+            pipeline: MistralRsBuilder::new(pipeline, scheduler_config, false, None)
+                .build()
+                .await,
             counter: AtomicUsize::new(0),
+            ring_config,
         }
     }
 
@@ -412,11 +571,26 @@ impl MistralLlama {
             logits_processors: None,
             return_raw_logits: false,
             model_id: None, // Not actually needed.
+            truncate_sequence: false,
+            max_tool_rounds: None,
+            tool_dispatch_url: None,
+            // mistral.rs v0.9.0 agentic / code-execution / shell / files features:
+            // Spice does not use them, so opt out with defaults.
+            enable_code_execution: false,
+            enable_shell: false,
+            shell_options: None,
+            code_execution_permission: None,
+            code_execution_approval_notifier: None,
+            agent_permission: None,
+            agent_approval_handler: None,
+            agent_approval_notifier: None,
+            session_id: None,
+            files: None,
+            input_files: Vec::new(),
         }))
     }
 
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
-    #[allow(clippy::cast_possible_truncation)]
     async fn send_message(
         &self,
         req: CreateChatCompletionRequest,
@@ -428,6 +602,7 @@ impl MistralLlama {
                 .map(message_to_mistral)
                 .collect::<Vec<_>>(),
             enable_thinking: None,
+            reasoning_effort: None,
         };
 
         let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
@@ -441,9 +616,10 @@ impl MistralLlama {
             top_n_logprobs: req.top_logprobs.unwrap_or_default().into(),
             frequency_penalty: req.frequency_penalty,
             presence_penalty: req.presence_penalty,
+            repetition_penalty: None,
             stop_toks: req.stop.map(|s| match s {
-                Stop::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
-                Stop::StringArray(s) => mistralrs::StopTokens::Seqs(s),
+                StopConfiguration::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
+                StopConfiguration::StringArray(s) => mistralrs::StopTokens::Seqs(s),
             }),
             max_len: req.max_completion_tokens.map(|x| x as usize),
             logits_bias: None,
@@ -677,6 +853,29 @@ fn stream_from_response(
                 },
                 MistralResponse::Raw{..} => {
                     unreachable!("We set `return_raw_logits: false`")
+                },
+                MistralResponse::Embeddings{..} => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: "Embeddings response is not supported in chat".to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
+                }
+                // mistral.rs v0.9.0 agentic / diffusion / file responses: Spice does
+                // not enable those features on the chat path (agent_permission/files
+                // are None), so they should not occur here. Surface an error rather
+                // than panic if the engine ever emits one.
+                MistralResponse::AgenticToolCallProgress { .. }
+                | MistralResponse::BlockDenoisingProgress(_)
+                | MistralResponse::AgenticToolApprovalRequired { .. }
+                | MistralResponse::File(_) => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: "Unsupported response type for chat completions".to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
                 }
              }
         }
@@ -684,7 +883,7 @@ fn stream_from_response(
 }
 
 /// Convert a [`CompletionChunkResponse`] to a [`CreateChatCompletionStreamResponse`].
-#[allow(clippy::cast_possible_truncation)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 fn chunk_to_openai_stream(
     c: ChatCompletionChunkResponse,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
@@ -711,11 +910,7 @@ fn chunk_to_openai_stream(
     Ok(response)
 }
 
-#[allow(
-    deprecated,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, OpenAIError> {
     let ChunkChoice {
         index,
@@ -724,13 +919,13 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
         ..
     } = choice;
     let role: Role = serde_json::from_str(&format!("\"{}\"", delta.role))
-        .map_err(OpenAIError::JSONDeserialize)?;
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to parse role: {e}")))?;
 
     let finish_reason: Option<FinishReason> = finish_reason
         .as_ref()
         .map(|f| serde_json::from_str(&format!("\"{f}\"")))
         .transpose()
-        .map_err(OpenAIError::JSONDeserialize)?;
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to parse finish_reason: {e}")))?;
 
     Ok(ChatChoiceStream {
         index: *index as u32,
@@ -752,12 +947,13 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
 
 fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> ToolChoice {
     match x {
-        ChatCompletionToolChoiceOption::None => ToolChoice::None,
-        ChatCompletionToolChoiceOption::Auto => ToolChoice::Auto,
-        ChatCompletionToolChoiceOption::Required => {
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => ToolChoice::Auto,
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => {
             unimplemented!("`mistral_rs::core` does not yet have `ToolChoice::Required`")
         }
-        ChatCompletionToolChoiceOption::Named(t) => ToolChoice::Tool(convert_named_tool(t)),
+        ChatCompletionToolChoiceOption::Function(t) => ToolChoice::Tool(convert_named_tool(t)),
+        // None, AllowedTools, or Custom not supported
+        _ => ToolChoice::None,
     }
 }
 
@@ -770,21 +966,34 @@ fn convert_named_tool(x: &ChatCompletionNamedToolChoice) -> Tool {
             description: None,
             name: x.function.name.clone(),
             parameters: None,
+            strict: None,
         },
     }
 }
 
-fn convert_tool(x: &ChatCompletionTool) -> Tool {
-    Tool {
-        tp: ToolType::Function,
-        function: Function {
-            description: x.function.description.clone(),
-            name: x.function.name.clone(),
-            parameters: x
-                .function
-                .parameters
-                .clone()
-                .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
+fn convert_tool(x: &ChatCompletionTools) -> Tool {
+    match x {
+        ChatCompletionTools::Function(tool) => Tool {
+            tp: ToolType::Function,
+            function: Function {
+                description: tool.function.description.clone(),
+                name: tool.function.name.clone(),
+                parameters: tool
+                    .function
+                    .parameters
+                    .clone()
+                    .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
+                strict: None,
+            },
+        },
+        ChatCompletionTools::Custom(_) => Tool {
+            tp: ToolType::Function,
+            function: Function {
+                description: None,
+                name: String::new(),
+                parameters: None,
+                strict: None,
+            },
         },
     }
 }
@@ -796,7 +1005,7 @@ fn parse_tool_call_response(
     ChatCompletionMessageToolCallChunk {
         id: Some(r.id.clone()),
         index,
-        r#type: Some(ChatCompletionToolType::Function),
+        r#type: Some(FunctionType::Function),
         function: Some(FunctionCallStream {
             name: Some(r.function.name.clone()),
             arguments: Some(r.function.arguments.clone()),

@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use axum::{
     body::Bytes,
     http::StatusCode,
@@ -27,7 +29,7 @@ use serde::Deserialize;
 use crate::datafusion::{param_utils, request_context_extension::get_current_datafusion};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-use super::{ResponseMimeType, sql_to_http_response};
+use super::{ResponseMimeType, current_principal_requires_read_only, sql_to_http_response};
 
 /// SQL Query
 ///
@@ -193,7 +195,7 @@ pub(crate) async fn post(
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
 
-    let (sql, parameters) = if let Some("application/json") = content_type {
+    let (sql, parameters) = if content_type == Some("application/json") {
         match serde_json::from_slice::<ParameterizedQuery>(&body) {
             Ok(ParameterizedQuery { sql, parameters }) => {
                 let parameters = match param_utils::convert_json_to_param_values(parameters) {
@@ -205,7 +207,8 @@ pub(crate) async fn post(
                     }
                 };
 
-                (sql, Some(parameters))
+                // Move the deserialized String into Arc<str> without a second copy.
+                (Arc::<str>::from(sql), Some(parameters))
             }
             Err(e) => {
                 tracing::debug!("Error parsing JSON: {e}");
@@ -213,8 +216,9 @@ pub(crate) async fn post(
             }
         }
     } else {
-        let sql = match String::from_utf8(body.to_vec()) {
-            Ok(query) => query,
+        // Decode once into Arc<str> so QueryBuilder does not re-copy the SQL body.
+        let sql = match std::str::from_utf8(&body) {
+            Ok(query) => Arc::<str>::from(query),
             Err(e) => {
                 tracing::debug!("Error reading query: {e}");
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -225,9 +229,10 @@ pub(crate) async fn post(
 
     sql_to_http_response(
         df,
-        &sql,
+        sql,
         parameters,
         ResponseMimeType::from_accept_header(accept.as_ref()),
+        current_principal_requires_read_only().await,
     )
     .await
 }

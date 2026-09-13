@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::hash::Hash;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
@@ -24,31 +25,27 @@ use datafusion::{
     logical_expr::{
         ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
         interval_arithmetic::Interval,
-        simplify::{ExprSimplifyResult, SimplifyInfo},
+        simplify::{ExprSimplifyResult, SimplifyContext},
         sort_properties::{ExprProperties, SortProperties},
     },
     prelude::Expr,
 };
 
 /// Aliases an existing Scalar UDF to a new name.
-#[derive(Debug)]
-pub struct ScalarUDFAlias {
-    scalar_udf: Arc<dyn ScalarUDFImpl>,
+#[derive(Debug, Hash, Eq, PartialEq)]
+pub struct ScalarUDFAlias<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> {
+    scalar_udf: Arc<T>,
     alias: &'static str,
 }
 
-impl ScalarUDFAlias {
+impl<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> ScalarUDFAlias<T> {
     #[must_use]
-    pub fn new(scalar_udf: Arc<dyn ScalarUDFImpl>, alias: &'static str) -> Self {
+    pub fn new(scalar_udf: Arc<T>, alias: &'static str) -> Self {
         Self { scalar_udf, alias }
     }
 }
 
-impl ScalarUDFImpl for ScalarUDFAlias {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
+impl<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> ScalarUDFImpl for ScalarUDFAlias<T> {
     fn name(&self) -> &'static str {
         self.alias
     }
@@ -85,7 +82,7 @@ impl ScalarUDFImpl for ScalarUDFAlias {
     fn simplify(
         &self,
         args: Vec<Expr>,
-        info: &dyn SimplifyInfo,
+        info: &SimplifyContext,
     ) -> DataFusionResult<ExprSimplifyResult> {
         self.scalar_udf.simplify(args, info)
     }

@@ -15,14 +15,19 @@ limitations under the License.
 */
 
 use crate::embeddings::Embed;
-use crate::embeddings::Error::{FailedToInstantiateEmbeddingModel, UnsupportedEmbeddingInput};
-use async_openai::types::EmbeddingInput;
+use crate::embeddings::Error::{
+    FailedToInstantiateEmbeddingModel, LocalModelPathDoesNotExist, UnsupportedEmbeddingInput,
+};
+use async_openai::types::embeddings::EmbeddingInput;
 use async_trait::async_trait;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use model2vec_rs::model::StaticModel;
 use std::fmt::{Debug, Formatter};
+use std::io::{Error as IoError, ErrorKind};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use util::home_dir::home_dir;
 
 /// A wrapper around the `model2vec` library for generating text embeddings.
 ///
@@ -30,7 +35,9 @@ use std::sync::Arc;
 /// transformer models into static word embeddings.
 pub struct Model2Vec {
     pub name: String,
-    model: StaticModel,
+    // `Arc` so the model can be shared into `spawn_blocking` to run the
+    // (CPU-bound, synchronous) forward pass off the async runtime thread.
+    model: Arc<StaticModel>,
 
     // Bound on model instantiation
     normalize: Option<bool>,
@@ -73,12 +80,30 @@ impl Model2Vec {
         embed_max_token_length: Option<usize>,
         embed_custom_batch_size: Option<usize>,
     ) -> Result<Self, super::embeddings::Error> {
-        let model = StaticModel::from_pretrained(name, hf_token, normalize, subfolder)
+        let name = if let Some(local_model_path) = local_model_path(name)? {
+            match local_model_path.try_exists() {
+                Ok(true) => local_model_path.to_string_lossy().into_owned(),
+                Ok(false) => {
+                    return Err(LocalModelPathDoesNotExist {
+                        path: name.to_string(),
+                    });
+                }
+                Err(source) => {
+                    return Err(FailedToInstantiateEmbeddingModel {
+                        source: source.into(),
+                    });
+                }
+            }
+        } else {
+            name.to_string()
+        };
+
+        let model = StaticModel::from_pretrained(&name, hf_token, normalize, subfolder)
             .map_err(|e| FailedToInstantiateEmbeddingModel { source: e.into() })?;
 
         let model2vec = Self {
-            name: name.to_string(),
-            model,
+            name,
+            model: Arc::new(model),
             normalize,
             parallelism,
             embed_max_token_length,
@@ -101,6 +126,45 @@ impl Model2Vec {
     }
 }
 
+fn looks_like_local_model_path(name: &str) -> bool {
+    let path = Path::new(name);
+    path.is_absolute()
+        || name.starts_with("./")
+        || name.starts_with("../")
+        || name.starts_with(".\\")
+        || name.starts_with("..\\")
+        || name.starts_with("~/")
+        || name.starts_with("~\\")
+}
+
+fn local_model_path(name: &str) -> Result<Option<PathBuf>, super::embeddings::Error> {
+    if let Some(home_relative_path) = name.strip_prefix("~/").or_else(|| name.strip_prefix("~\\")) {
+        let Some(home_dir) = home_dir() else {
+            return Err(FailedToInstantiateEmbeddingModel {
+                source: IoError::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "Unable to resolve home directory while expanding local model path '{name}'"
+                    ),
+                )
+                .into(),
+            });
+        };
+
+        // Trim leading path separators so `~//foo` doesn't silently resolve to `/foo`
+        // via PathBuf::join's absolute-path override.
+        let home_relative_path = home_relative_path.trim_start_matches(['/', '\\']);
+
+        return Ok(Some(home_dir.join(home_relative_path)));
+    }
+
+    if looks_like_local_model_path(name) {
+        return Ok(Some(Path::new(name).to_path_buf()));
+    }
+
+    Ok(None)
+}
+
 impl Debug for Model2Vec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let Self {
@@ -116,6 +180,34 @@ impl Debug for Model2Vec {
             "Model2Vec: {name}, normalize: {normalize:?}, parallelism: {parallelism:?}, embed_max_token_length: {embed_max_token_length:?}, embed_custom_batch_size: {embed_custom_batch_size:?}"
         )
     }
+}
+
+/// Run the `Model2Vec` forward pass. Synchronous and CPU-bound — callers on the
+/// async runtime must invoke this via `spawn_blocking`.
+fn encode_with_static_model(
+    model: &StaticModel,
+    input: EmbeddingInput,
+    model_name: &str,
+    max_token_length: Option<usize>,
+    batch_size: usize,
+) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
+    let embedding_input = match input {
+        EmbeddingInput::String(s) => vec![s],
+        EmbeddingInput::StringArray(sentences) => sentences,
+        _ => {
+            return Err(UnsupportedEmbeddingInput {
+                model: model_name.to_string(),
+                message: "Model2Vec models only support strings or vectors of strings".to_string(),
+            });
+        }
+    };
+
+    if embedding_input.is_empty() {
+        tracing::debug!("Embedding input is empty, returning empty vector");
+        return Ok(vec![]);
+    }
+
+    Ok(model.encode_with_args(&embedding_input, max_token_length, batch_size))
 }
 
 #[async_trait]
@@ -144,7 +236,28 @@ impl Embed for Model2Vec {
             return Ok(cached);
         }
 
-        let vectors = self.embed_sync(input.clone())?;
+        // The forward pass is CPU-bound and synchronous; run it on the blocking
+        // pool so it doesn't stall the async runtime thread (which also serves
+        // `/health`, `/v1/embeddings`, etc.).
+        let model = Arc::clone(&self.model);
+        let model_name = self.name.clone();
+        let max_token_length = self.embed_max_token_length;
+        let batch_size = self.embed_custom_batch_size.unwrap_or(1024);
+        // `cache_key` borrows `input`, so hand the blocking task an owned clone.
+        let owned_input = input.clone();
+        let vectors = tokio::task::spawn_blocking(move || {
+            encode_with_static_model(
+                &model,
+                owned_input,
+                &model_name,
+                max_token_length,
+                batch_size,
+            )
+        })
+        .await
+        .map_err(|e| super::embeddings::Error::FailedToCreateEmbedding {
+            source: Box::new(e),
+        })??;
 
         if let Some(key) = cache_key {
             self.put_cached_embed(key, CachedEmbeddingResult::Vector(vectors.clone()))
@@ -155,23 +268,13 @@ impl Embed for Model2Vec {
     }
 
     fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, super::embeddings::Error> {
-        let embedding_input = match input {
-            EmbeddingInput::String(s) => vec![s],
-            EmbeddingInput::StringArray(sentences) => sentences,
-            _ => {
-                return Err(UnsupportedEmbeddingInput {
-                    model: self.name.clone(),
-                    message: "Model2Vec models only support strings or vectors of strings"
-                        .to_string(),
-                });
-            }
-        };
-
-        Ok(self.model.encode_with_args(
-            &embedding_input,
+        encode_with_static_model(
+            &self.model,
+            input,
+            &self.name,
             self.embed_max_token_length,
             self.embed_custom_batch_size.unwrap_or(1024),
-        ))
+        )
     }
 
     fn supports_sync_embeddings(&self) -> bool {
@@ -190,10 +293,79 @@ impl Embed for Model2Vec {
 #[cfg(test)]
 mod tests {
     use crate::embeddings::Embed;
+    use crate::embeddings::Error;
     use crate::model2vec::Model2Vec;
-    use async_openai::types::EmbeddingInput;
+    use async_openai::types::embeddings::EmbeddingInput;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[tokio::test]
+    use super::{home_dir, local_model_path, looks_like_local_model_path};
+
+    #[test]
+    fn detects_local_model_paths() {
+        assert!(looks_like_local_model_path("/tmp/model"));
+        assert!(looks_like_local_model_path("//tmp/model"));
+        assert!(looks_like_local_model_path("./model"));
+        assert!(looks_like_local_model_path("../model"));
+        assert!(looks_like_local_model_path("~/model"));
+        assert!(!looks_like_local_model_path("minishlab/potion-base-8M"));
+    }
+
+    #[test]
+    fn missing_local_model_path_returns_specific_error() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let missing_path = std::env::temp_dir().join(format!("missing-model2vec-{suffix}"));
+        assert!(
+            !missing_path
+                .try_exists()
+                .expect("test path check should not fail"),
+            "test path should not exist before model loading"
+        );
+        let missing_path = missing_path.to_string_lossy().into_owned();
+
+        let err = Model2Vec::from_params(&missing_path, None, None, None, None, None, None)
+            .expect_err("missing local model path should fail before Hugging Face lookup");
+
+        assert!(
+            matches!(err, Error::LocalModelPathDoesNotExist { ref path } if path == &missing_path),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn expands_home_directory_model_paths() {
+        let Some(home_dir_path) = home_dir() else {
+            return;
+        };
+
+        assert_eq!(
+            local_model_path("~/model")
+                .expect("home-relative model path should resolve")
+                .expect("home-relative model path should be treated as local"),
+            home_dir_path.join("model")
+        );
+
+        #[cfg(windows)]
+        assert_eq!(
+            local_model_path("~\\model")
+                .expect("home-relative model path should resolve")
+                .expect("home-relative model path should be treated as local"),
+            home_dir_path.join("model")
+        );
+
+        // Leading separators after `~/` must not silently resolve to an absolute path
+        // outside the home directory.
+        assert_eq!(
+            local_model_path("~//tmp/model")
+                .expect("home-relative model path should resolve")
+                .expect("home-relative model path should be treated as local"),
+            home_dir_path.join("tmp/model")
+        );
+    }
+
+    #[expect(dead_code)]
     async fn test_embed() {
         // This embedding is dim 256
         let model = Model2Vec::from_params(
@@ -238,12 +410,12 @@ mod tests {
 
         let embed_ints = model.embed(EmbeddingInput::IntegerArray(vec![1])).await;
 
-        assert!(embed_ints.is_err());
+        embed_ints.expect_err("Should fail for integer input");
 
         let embed_2d_int = model
             .embed(EmbeddingInput::ArrayOfIntegerArray(vec![vec![1]]))
             .await;
 
-        assert!(embed_2d_int.is_err());
+        embed_2d_int.expect_err("Should fail for 2D integer input");
     }
 }

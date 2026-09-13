@@ -14,13 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::component::dataset::{Dataset, acceleration::RefreshMode};
+use crate::component::dataset::{Dataset, DatasetSpec, acceleration::RefreshMode};
+use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use datafusion::{
     catalog::Session,
     common::{Constraint, Constraints, project_schema},
@@ -32,8 +34,55 @@ use datafusion::{
     },
 };
 use futures::Future;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 
-use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec};
+use super::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
+};
+
+/// The schema a `sink` source advertises when it has no acceleration to inherit from.
+///
+/// A `sink` produces no data of its own; the single `placeholder` column exists only to give
+/// it a non-empty, well-formed schema.
+fn placeholder_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "placeholder",
+        DataType::Utf8,
+        false,
+    )]))
+}
+
+/// The schema an accelerated `sink` dataset should advertise as its (no-op) source.
+///
+/// A `sink` dataset stores everything in its acceleration, so on restart the acceleration
+/// checkpoint — e.g. the schema grown by the OpenTelemetry metric-dimension ingest — is the
+/// authoritative schema, not the bare `placeholder`. Advertising `placeholder` instead makes
+/// the federated-table reconciliation report every accelerated column as missing (and
+/// `placeholder` as unexpected), deferring the dataset with a schema-mismatch warning on
+/// every restart even though no source schema actually changed.
+///
+/// Returns `None` when there is no existing checkpoint to inherit — a first run, or a
+/// non-file accelerator — so the caller falls back to [`placeholder_schema`], preserving the
+/// pre-acceleration behavior.
+pub(crate) async fn accelerated_checkpoint_schema(dataset: &Dataset) -> Option<SchemaRef> {
+    if !dataset.is_file_accelerated() {
+        return None;
+    }
+    let registry = dataset.runtime.accelerator_engine_registry();
+    let checkpoint = dataset_checkpointer(
+        dataset,
+        registry,
+        OpenOption::OpenExisting,
+        SnapshotBehavior::Disabled,
+    )
+    .await
+    .ok()?;
+    checkpoint.get_schema().await.ok().flatten()
+}
+
+/// Connector name for the [`SinkConnector`], as it appears in a dataset's `from: sink:...`.
+pub const SINK_DATACONNECTOR: &str = "sink";
 
 /// A no-op connector that allows for Spice to act as a "sink" for data.
 ///
@@ -87,19 +136,32 @@ impl DataConnectorFactory for SinkConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
-        _params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    fn create<'a>(
+        &'a self,
+        params: ConnectorParams,
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let schema = Schema::new(vec![Field::new("placeholder", DataType::Utf8, false)]);
+            // Inherit the acceleration checkpoint schema when the dataset is accelerated, so a
+            // restart re-advertises the stored (e.g. OTLP-evolved) schema instead of the bare
+            // `placeholder` and the federated-table reconciliation sees no spurious change.
+            // Reading the checkpoint needs the accelerator engine registry and the secrets, so
+            // the spec is rebound to the runtime handles from the connector context; without a
+            // context (connector unit tests) there is no accelerator to inherit from.
+            let schema = match &params.component {
+                ConnectorComponent::Dataset(spec) => {
+                    context.accelerated_checkpoint_schema(spec).await
+                }
+                ConnectorComponent::Catalog(_) => None,
+            }
+            .unwrap_or_else(placeholder_schema);
 
-            Ok(Arc::new(SinkConnector::new(Arc::new(schema))) as Arc<dyn DataConnector>)
+            Ok(Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>)
         })
     }
 
     fn prefix(&self) -> &'static str {
-        "sink"
+        SINK_DATACONNECTOR
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
@@ -119,14 +181,16 @@ impl DataConnector for SinkConnector {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        _dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(self.clone()))
     }
 
     async fn read_write_provider(
         &self,
-        _dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        _dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         Some(Ok(Arc::new(self.clone())))
     }
@@ -134,10 +198,6 @@ impl DataConnector for SinkConnector {
 
 #[async_trait]
 impl TableProvider for SinkConnector {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -184,10 +244,6 @@ struct SinkDataSink {
 
 #[async_trait]
 impl DataSink for SinkDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -198,10 +254,17 @@ impl DataSink for SinkDataSink {
 
     async fn write_all(
         &self,
-        _data: SendableRecordBatchStream,
+        mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
-        Ok(0)
+        use futures::StreamExt as _;
+        // Drain the stream to satisfy the streaming contract even though
+        // the sink discards the data.
+        let mut rows: u64 = 0;
+        while let Some(batch) = data.next().await {
+            rows += batch?.num_rows() as u64;
+        }
+        Ok(rows)
     }
 }
 
@@ -223,3 +286,5 @@ impl DisplayAs for SinkDataSink {
         write!(f, "SinkDataSink")
     }
 }
+
+data_connector_api::register_data_connector!("sink", SinkConnectorFactory);

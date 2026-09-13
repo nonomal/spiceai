@@ -16,17 +16,24 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::arrow::ArrowFactory;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
+    catalog::TableProviderFactory,
+    common::{Constraint, Constraints},
+    datasource::TableProvider,
+    execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
 use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
+use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::parameters::ParameterSpec;
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator};
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption, unsupported_sidecar};
+use runtime_checkpoint_api::CheckpointError;
 
 pub struct ArrowAccelerator {
     arrow_factory: ArrowFactory,
@@ -47,7 +54,37 @@ impl Default for ArrowAccelerator {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("file_watcher")];
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("file_watcher"),
+    ParameterSpec::component("sort_columns")
+        .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+];
+
+pub(crate) fn enable_hash_index_for_primary_key_or_indexes(cmd: &mut CreateExternalTable) {
+    let has_primary_key = cmd.constraints.iter().any(
+        |constraint| matches!(constraint, Constraint::PrimaryKey(columns) if !columns.is_empty()),
+    );
+    let has_indexes = cmd
+        .options
+        .get("indexes")
+        .is_some_and(|indexes| !indexes.trim().is_empty());
+
+    if !has_primary_key && !has_indexes {
+        return;
+    }
+
+    if let Some(value) = cmd.options.get("hash_index")
+        && !value.eq_ignore_ascii_case("enabled")
+    {
+        tracing::warn!(
+            hash_index = %value,
+            "Arrow acceleration with primary_key or indexes requires hash_index; overriding hash_index to enabled"
+        );
+    }
+
+    cmd.options
+        .insert("hash_index".to_string(), "enabled".to_string());
+}
 
 #[async_trait]
 impl DataAccelerator for ArrowAccelerator {
@@ -62,16 +99,33 @@ impl DataAccelerator for ArrowAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: CreateExternalTable,
-        _source: Option<&dyn AccelerationSource>,
-        partition_by: Vec<PartitionedBy>,
+        mut cmd: CreateExternalTable,
+        source: Option<&dyn AccelerationSource>,
+        _partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        ensure!(
-            partition_by.is_empty(),
-            super::InvalidConfigurationSnafu {
-                msg: "Arrow data accelerator does not support the `partition_by` parameter but it was provided".to_string()
-            }
-        );
+        // For caching mode, strip primary key constraints since Arrow uses InsertOp::Replace
+        // which overwrites the entire table. Primary key constraints cause uniqueness validation
+        // errors during inserts because Arrow doesn't support upsert operations.
+        let is_caching_mode = source
+            .and_then(|s| s.acceleration())
+            .and_then(|a| a.refresh_mode.as_ref())
+            .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
+
+        if is_caching_mode {
+            cmd.constraints = Constraints::new_unverified(vec![]);
+        }
+
+        // Extract sort_columns from acceleration params if provided
+        if let Some(source) = source
+            && let Some(acceleration) = source.acceleration()
+            && let Some(sort_cols_str) = acceleration.params.get("sort_columns")
+        {
+            cmd.options
+                .insert("sort_columns".to_string(), sort_cols_str.clone());
+        }
+
+        enable_hash_index_for_primary_key_or_indexes(&mut cmd);
 
         let ctx = SessionContext::new();
         let table_provider = TableProviderFactory::create(&self.arrow_factory, &ctx.state(), &cmd)
@@ -79,6 +133,17 @@ impl DataAccelerator for ArrowAccelerator {
             .boxed()?;
 
         Ok(table_provider)
+    }
+
+    async fn sidecar(
+        &self,
+        _source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        _open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        // In-memory: there is no database to keep sidecar tables in, and nothing would
+        // survive a restart if there were.
+        Err(unsupported_sidecar("arrow", "sidecar"))
     }
 
     fn prefix(&self) -> &'static str {
@@ -89,3 +154,5 @@ impl DataAccelerator for ArrowAccelerator {
         PARAMETERS
     }
 }
+
+data_accelerator_api::register_data_accelerator!(Engine::Arrow, ArrowAccelerator);

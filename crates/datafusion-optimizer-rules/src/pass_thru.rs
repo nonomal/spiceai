@@ -23,7 +23,7 @@ use datafusion::{
         SendableRecordBatchStream,
     },
 };
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 type DisplayFormattingFn =
     dyn Fn(DisplayFormatType, &mut fmt::Formatter) -> fmt::Result + Send + Sync + 'static;
@@ -31,7 +31,7 @@ type DisplayFormattingFn =
 /// `PassThruExec` is a generic physical [`ExecutionPlan`] wrapper that injects custom logic via a user-provided closure,
 /// forwarding execution to its input plan.
 /// This avoids the need to reimplement similar wrappers for different custom logic, side effects, or instrumentation.
-pub(crate) struct PassThruExec<F>
+pub struct PassThruExec<F>
 where
     F: Fn(
             &Arc<dyn ExecutionPlan>,
@@ -71,12 +71,14 @@ where
     }
 
     /// Override default input partitioning [`Distribution::UnspecifiedDistribution`].
+    #[must_use]
     pub fn with_input_partitioning(mut self, dist: Distribution) -> Self {
         self.required_input_distribution = dist;
         self
     }
 
     /// Set a custom display formatter for this execution plan
+    #[must_use]
     pub fn with_display_fmt_fn<FF>(mut self, display_fmt_fn: FF) -> Self
     where
         FF: Fn(DisplayFormatType, &mut fmt::Formatter) -> fmt::Result + Send + Sync + 'static,
@@ -150,10 +152,8 @@ where
     fn name(&self) -> &'static str {
         self.name
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
+
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input_exec.properties()
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

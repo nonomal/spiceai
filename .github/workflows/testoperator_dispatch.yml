@@ -2,7 +2,7 @@ name: testoperator dispatch
 
 on:
   schedule:
-    # Every day, at 0900 UTC (0200 PDT)
+    # daily-main, 0900 UTC / 0200 PDT  — full bench suite
     - cron: '0 9 * * *'
 
   workflow_dispatch:
@@ -20,7 +20,13 @@ on:
           - 'bench'
           - 'load'
           - 'throughput'
+          - 'append'
           - 'http-consistency'
+          - 'nas'
+          - 'schema'
+          - 'text-to-sql'
+          - 'streaming-bench'
+          - 'streaming-correctness'
       update_snapshots:
         description: 'Update snapshots?'
         required: false
@@ -36,19 +42,22 @@ jobs:
   dispatch-scheduled:
     name: Dispatch tests - Scheduled
     runs-on: spiceai-dev-runners
+    # daily-main dispatches the bench suite (including the chbench bench run) and returns once all child workflows are dispatched
+    timeout-minutes: 720
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.scheduled == 'true') }}
     strategy:
       fail-fast: false
       matrix:
         branch:
           - 'trunk'
-          - 'release/1.8'
+          - 'release/2.3'
     concurrency:
-      group: testoperator-dispatch-scheduled
+      group: testoperator-dispatch-scheduled-${{ matrix.branch }}-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ matrix.branch }}
 
       - name: Install MinIO
@@ -74,15 +83,104 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
-      - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF1
+      - name: Build spicepod validator
+        id: build-spicepod-validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Set spicepod validator path
+        run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
+
+      # Map the cron that fired to a human-readable schedule name. 
+      # Every gated step reads steps.sched.outputs.name.
+      - name: Resolve schedule name
+        id: sched
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow bench
+          case "${{ github.event.schedule }}" in
+            '0 9 * * *')               NAME=daily-main ;;
+            *)                         NAME=           ;;   # manual / unrecognized cron — match nothing
+          esac
+          echo "Resolved schedule name: $NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Validate spicepods - TPCH - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - ClickBench - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCH - SF100
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF100
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - CH-BenCHmark
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/chbench/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          shopt -s globstar nullglob
+          failed=0
+          for file in ./tools/testoperator/dispatch/tpch/sf1/**/*.yaml; do
+            case "$file" in
+              # The ScyllaDB connector is not in the `default` feature set, so the spiced build this suite runs against cannot load it.
+              ./tools/testoperator/dispatch/tpch/sf1/federated/scylladb.yaml) continue ;;
+            esac
+            if ! testoperator dispatch "$file" --workflow bench; then
+              failed=1
+            fi
+          done
+          exit "$failed"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - TPCDS
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf1 --workflow bench
         env:
@@ -91,6 +189,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Bench - ClickBench
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/clickbench/sf1 --workflow bench
         env:
@@ -98,9 +197,68 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
+      # Catalog-connector discovery tests. Only the dispatch configs that declare a
+      # `schema` block are dispatched, so this is the catalog spicepods.
+      - name: Dispatch Testoperator - Scheduled Schema - TPCH - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow schema
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled Append - TPCH - SF1
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow append
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF100
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled Bench - TPCDS - SF100
+        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled Streaming - Bench
+        if: false
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled Streaming - Correctness
+        if: false
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-correctness
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      # CH-benCHmark explain-plan bench (no OLTP load) runs with the daily bench suite. The scheduled
+      # HTAP runs (SF1/SF100/SF1000) are part of testoperator_dispatch_htap.yml.
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark Bench - SF100
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow bench
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -114,7 +272,9 @@ jobs:
       group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -139,6 +299,57 @@ jobs:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        id: build-spicepod-validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Set spicepod validator path
+        run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
+
+      - name: Validate spicepods - TPCH - SF1
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF1
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - ClickBench - SF1
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCH - SF100
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF100
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF1
         run: |
@@ -173,6 +384,37 @@ jobs:
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF100
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCDS - SF100
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Text to SQL
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/text_to_sql \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Streaming
+        if: false
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/streaming \
             --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:

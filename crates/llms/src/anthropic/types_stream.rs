@@ -17,17 +17,18 @@ limitations under the License.
 use super::types::{MessageRole, StopReason, Usage};
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role,
+        ChatCompletionStreamResponseDelta, CompletionTokensDetails, CompletionUsage,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType,
+        PromptTokensDetails, Role,
     },
 };
 use futures::{Stream, StreamExt};
 use reqwest_eventsource::Error as SseError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, fmt, pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use tokio::sync::Mutex;
 
@@ -52,6 +53,13 @@ pub enum MessageCreateStreamResponse {
     MessageDelta { delta: MessageDelta, usage: Usage },
     #[serde(rename = "message_stop")]
     MessageStop,
+    /// Anthropic answers a mid-stream failure with an `error` event over an HTTP 200 stream — an
+    /// `overloaded_error` when it sheds load partway through a generation, and the other error
+    /// types with it. Without a variant for it the packet is a serde failure, and the caller is
+    /// handed the deserializer's "unknown variant" complaint instead of the failure Anthropic
+    /// actually reported.
+    #[serde(rename = "error")]
+    Error { error: ApiError },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -74,6 +82,10 @@ pub enum ContentBlock {
     Text { text: String },
     #[serde(rename = "tool_use")]
     ToolUse(ContentBlockToolUse),
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 impl ContentBlock {
@@ -93,12 +105,21 @@ impl ContentBlock {
                     tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
                         index: 0,
                         id: Some(id),
-                        r#type: Some(ChatCompletionToolType::Function),
+                        r#type: Some(FunctionType::Function),
                         function: Some(FunctionCallStream {
                             name: Some(name),
                             arguments: None,
                         }),
                     }]),
+                    refusal: None,
+                    role: None,
+                }
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: None,
                     refusal: None,
                     role: None,
                 }
@@ -152,7 +173,7 @@ impl Delta {
                 tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
                     index: 0,
                     id: Some(id.clone()),
-                    r#type: Some(ChatCompletionToolType::Function),
+                    r#type: Some(FunctionType::Function),
                     function: Some(FunctionCallStream {
                         name: None, // Intentially leave empty to match OpenAI's format.
                         arguments: Some(partial_json),
@@ -185,60 +206,6 @@ impl Delta {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct AnthropicStreamError {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub error: ErrorPayload,
-}
-
-impl fmt::Display for AnthropicStreamError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "AnthropicStreamError: {:?}", self.error)
-    }
-}
-
-impl From<reqwest_eventsource::Error> for AnthropicStreamError {
-    fn from(e: reqwest_eventsource::Error) -> Self {
-        let message = if let reqwest_eventsource::Error::InvalidStatusCode(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            _,
-        ) = &e
-        {
-            "Anthropic API limit exceeded. Check limits: https://console.anthropic.com/settings/limits.".to_string()
-        } else {
-            e.to_string()
-        };
-
-        AnthropicStreamError {
-            event_type: "error".to_string(),
-            error: ErrorPayload {
-                error_type: "reqwest_eventsource_error".to_string(),
-                message,
-            },
-        }
-    }
-}
-
-impl From<serde_json::Error> for AnthropicStreamError {
-    fn from(e: serde_json::Error) -> Self {
-        AnthropicStreamError {
-            event_type: "error".to_string(),
-            error: ErrorPayload {
-                error_type: "serde_json_error".to_string(),
-                message: e.to_string(),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ErrorPayload {
-    #[serde(rename = "type")]
-    error_type: String,
-    message: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
 pub struct MessageDelta {
     pub stop_reason: Option<StopReason>,
     pub stop_sequence: Option<String>,
@@ -259,11 +226,8 @@ pub struct MessageDelta {
 ///  | Tool packets have no out of order protection            | Provides numbering for out of order tool packets        |
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///
-#[allow(clippy::too_many_lines)]
 pub fn transform_stream(
-    stream: Pin<
-        Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
-    >,
+    stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>>,
 ) -> ChatCompletionResponseStream {
     // As mentioned above, only first tool packet has tool metadata.
     // Format:
@@ -302,13 +266,7 @@ pub fn transform_stream(
                     }) => {
                         state.role = MessageRole::from_opt(&inner_role);
                         state.id = Some(inner_id);
-                        state.usage = Some(CompletionUsage {
-                            prompt_tokens: inner_usage.input_tokens,
-                            completion_tokens: inner_usage.output_tokens,
-                            total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
-                            prompt_tokens_details: None,
-                            completion_tokens_details: None,
-                        });
+                        state.usage = Some(inner_usage.into());
                         state.model = Some(model);
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
@@ -362,9 +320,7 @@ pub fn transform_stream(
                     }) => {
                         // Update usage
                         if let Some(ref mut u) = state.usage {
-                            u.prompt_tokens += inner_usage.input_tokens;
-                            u.completion_tokens += inner_usage.output_tokens;
-                            u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
+                            add_usage_delta(u, inner_usage);
                         }
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
@@ -374,11 +330,17 @@ pub fn transform_stream(
                                 index: 0,
                                 logprobs: None,
                                 finish_reason: match stop_reason {
-                                    Some(StopReason::EndTurn | StopReason::StopSequence) => {
-                                        Some(FinishReason::Stop)
-                                    }
-                                    Some(StopReason::MaxTokens) => Some(FinishReason::Length),
+                                    Some(
+                                        StopReason::EndTurn
+                                        | StopReason::StopSequence
+                                        | StopReason::PauseTurn,
+                                    ) => Some(FinishReason::Stop),
+                                    Some(
+                                        StopReason::MaxTokens
+                                        | StopReason::ModelContextWindowExceeded,
+                                    ) => Some(FinishReason::Length),
                                     Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
+                                    Some(StopReason::Refusal) => Some(FinishReason::ContentFilter),
                                     None => None,
                                 },
                                 delta: ChatCompletionStreamResponseDelta {
@@ -396,14 +358,24 @@ pub fn transform_stream(
                         | MessageCreateStreamResponse::ContentBlockStop { .. }
                         | MessageCreateStreamResponse::MessageStop,
                     ) => None,
+                    Ok(MessageCreateStreamResponse::Error { error }) => {
+                        // An error Anthropic delivered as a stream packet is the same failure as
+                        // one it delivered as an HTTP status, and is reported the same way.
+                        let formatted_error =
+                            format_anthropic_stream_error(OpenAIError::ApiError(error));
+                        tracing::debug!(
+                            "Received an anthropic error stream packet: {:?}",
+                            formatted_error
+                        );
+                        Some(Err(formatted_error))
+                    }
                     Err(e) => {
-                        tracing::debug!("Received an anthropic error stream packet: {:?}", e);
-                        Some(Err(OpenAIError::ApiError(ApiError {
-                            message: e.error.message,
-                            r#type: Some("AnthropicStreamError".to_string()),
-                            param: None,
-                            code: None,
-                        })))
+                        let formatted_error = format_anthropic_stream_error(e);
+                        tracing::debug!(
+                            "Received an anthropic error stream packet: {:?}",
+                            formatted_error
+                        );
+                        Some(Err(formatted_error))
                     }
                 }
             }
@@ -415,6 +387,183 @@ pub fn transform_stream(
         });
 
     Box::pin(transformed_stream)
+}
+
+fn add_usage_delta(usage: &mut CompletionUsage, delta: Usage) {
+    let delta = CompletionUsage::from(delta);
+
+    usage.prompt_tokens = usage.prompt_tokens.saturating_add(delta.prompt_tokens);
+    usage.completion_tokens = usage
+        .completion_tokens
+        .saturating_add(delta.completion_tokens);
+    usage.total_tokens = usage.total_tokens.saturating_add(delta.total_tokens);
+    usage.prompt_tokens_details = combine_prompt_token_details(
+        usage.prompt_tokens_details.take(),
+        delta.prompt_tokens_details,
+    );
+    usage.completion_tokens_details = combine_completion_token_details(
+        usage.completion_tokens_details.take(),
+        delta.completion_tokens_details,
+    );
+}
+
+fn combine_prompt_token_details(
+    current: Option<PromptTokensDetails>,
+    delta: Option<PromptTokensDetails>,
+) -> Option<PromptTokensDetails> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(PromptTokensDetails {
+            audio_tokens: combine_opt_u32(current.audio_tokens, delta.audio_tokens),
+            cached_tokens: combine_opt_u32(current.cached_tokens, delta.cached_tokens),
+        }),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+fn combine_completion_token_details(
+    current: Option<CompletionTokensDetails>,
+    delta: Option<CompletionTokensDetails>,
+) -> Option<CompletionTokensDetails> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(CompletionTokensDetails {
+            accepted_prediction_tokens: combine_opt_u32(
+                current.accepted_prediction_tokens,
+                delta.accepted_prediction_tokens,
+            ),
+            audio_tokens: combine_opt_u32(current.audio_tokens, delta.audio_tokens),
+            reasoning_tokens: combine_opt_u32(current.reasoning_tokens, delta.reasoning_tokens),
+            rejected_prediction_tokens: combine_opt_u32(
+                current.rejected_prediction_tokens,
+                delta.rejected_prediction_tokens,
+            ),
+        }),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+fn combine_opt_u32(current: Option<u32>, delta: Option<u32>) -> Option<u32> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(current.saturating_add(delta)),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StreamErrorKind {
+    RateLimit,
+    Overloaded,
+    Authentication,
+    Permission,
+    Other,
+}
+
+/// What a streaming failure is, resolved from Anthropic's own error taxonomy.
+///
+/// The `type` field is the discriminator, not the message text: Anthropic echoes request detail
+/// back in an `invalid_request_error`, so a prompt, tool name, or model id that happens to carry
+/// `403` or `429` reads as a credential or rate-limit failure under a substring test — and the
+/// replacement message drops the original, leaving the real cause unrecoverable from the log.
+///
+/// The message tests survive only for an error carrying no `type` at all. A proxy in front of
+/// Anthropic may answer that way, and so does a 5xx from Anthropic itself: the SSE client does not
+/// parse a server-error body, and hands the whole thing over as an untyped message. A pre-stream
+/// `overloaded_error` therefore arrives untyped and lands in `Other`, while the same condition
+/// delivered as a mid-stream packet is typed and reaches the arm below — settling that difference
+/// means parsing the 5xx body, which is the client's job rather than this function's.
+fn classify_stream_error(api_error: &ApiError) -> StreamErrorKind {
+    match api_error.r#type.as_deref() {
+        // Anthropic's documented error types. Its 401 and its 403 stay apart because they are
+        // answered differently: a rejected key is rotated, a key without access is granted it.
+        Some("rate_limit_error") => StreamErrorKind::RateLimit,
+        Some("overloaded_error") => StreamErrorKind::Overloaded,
+        Some("authentication_error") => StreamErrorKind::Authentication,
+        Some("permission_error") => StreamErrorKind::Permission,
+        Some(_) => StreamErrorKind::Other,
+        None => classify_untyped_stream_error(&api_error.message),
+    }
+}
+
+/// The message tests, reached only when the error carries no `type`.
+fn classify_untyped_stream_error(message: &str) -> StreamErrorKind {
+    let lowered = message.to_lowercase();
+
+    if lowered.contains("too many requests") || lowered.contains("429") {
+        return StreamErrorKind::RateLimit;
+    }
+
+    if lowered.contains("401")
+        || lowered.contains("403")
+        || lowered.contains("authentication")
+        || lowered.contains("unauthorized")
+        || lowered.contains("forbidden")
+    {
+        return StreamErrorKind::Authentication;
+    }
+
+    StreamErrorKind::Other
+}
+
+fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
+    let OpenAIError::ApiError(api_error) = error else {
+        return error;
+    };
+
+    // A `not_found_error` arrives already explained by `explain_model_not_found`, which names the
+    // model and the parameter to change. Returning it untouched keeps that explanation, and keeps
+    // the `not_found_error` type a downstream check can still read.
+    if api_error.r#type.as_deref() == Some("not_found_error") {
+        return OpenAIError::ApiError(api_error);
+    }
+
+    // Anthropic's own message is carried through as the cause in every arm: the kind says what to
+    // do about the failure, and the cause is the only thing that says which request it was.
+    let (message, kind) = match classify_stream_error(&api_error) {
+        StreamErrorKind::RateLimit => (
+            format!(
+                "Anthropic API rate limit exceeded ({}). Check your limits at https://console.anthropic.com/settings/limits and retry shortly.",
+                api_error.message
+            ),
+            "AnthropicRateLimitError",
+        ),
+        StreamErrorKind::Overloaded => (
+            format!(
+                "Anthropic is overloaded and shed the request ({}). Retry with backoff — the model is temporarily unavailable rather than misconfigured.",
+                api_error.message
+            ),
+            "AnthropicOverloadedError",
+        ),
+        StreamErrorKind::Authentication => (
+            format!(
+                "Anthropic rejected the API key ({}). Check the key the model is configured with at https://console.anthropic.com/settings/keys.",
+                api_error.message
+            ),
+            "AnthropicAuthenticationError",
+        ),
+        StreamErrorKind::Permission => (
+            format!(
+                "The Anthropic API key is not permitted to make this request ({}). Grant it access to the model and workspace the request names, or configure the model with a key that has it.",
+                api_error.message
+            ),
+            "AnthropicPermissionError",
+        ),
+        StreamErrorKind::Other => (
+            format!("Anthropic streaming error: {}", api_error.message),
+            "AnthropicStreamError",
+        ),
+    };
+
+    OpenAIError::ApiError(ApiError {
+        message,
+        r#type: Some(kind.to_string()),
+        param: api_error.param,
+        code: api_error.code,
+    })
 }
 
 /// Easy way to create stream. Reduce boiler plate. [`CreateChatCompletionStreamResponse`] has no builder pattern.
@@ -430,4 +579,171 @@ fn create_anthropic_stream_response(
     };
 
     crate::streaming_utils::create_stream_response(id, model, choices, usage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_delta_accumulates_cache_tokens() {
+        let mut usage = Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cache_read_input_tokens: Some(3),
+            ..Usage::default()
+        }
+        .into();
+
+        add_usage_delta(
+            &mut usage,
+            Usage {
+                input_tokens: 2,
+                output_tokens: 4,
+                cache_creation_input_tokens: Some(5),
+                cache_read_input_tokens: Some(7),
+                ..Usage::default()
+            },
+        );
+
+        assert_eq!(usage.prompt_tokens, 27);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 32);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn usage_delta_saturates_token_counts() {
+        let mut usage = CompletionUsage {
+            prompt_tokens: u32::MAX - 1,
+            completion_tokens: u32::MAX - 1,
+            total_tokens: u32::MAX - 1,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(u32::MAX - 1),
+                audio_tokens: Some(u32::MAX - 1),
+            }),
+            completion_tokens_details: None,
+        };
+
+        add_usage_delta(
+            &mut usage,
+            Usage {
+                input_tokens: 2,
+                output_tokens: 2,
+                cache_read_input_tokens: Some(2),
+                ..Usage::default()
+            },
+        );
+
+        assert_eq!(usage.prompt_tokens, u32::MAX);
+        assert_eq!(usage.completion_tokens, u32::MAX);
+        assert_eq!(usage.total_tokens, u32::MAX);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.audio_tokens),
+            Some(u32::MAX - 1)
+        );
+    }
+    /// The streaming path explains a model-not-found upstream of `transform_stream`, so the
+    /// explanation has to survive this function. It did not: the fallback arm re-types every
+    /// `ApiError` as `AnthropicStreamError`, which both buried the actionable message behind a
+    /// `Anthropic streaming error:` prefix and made a downstream check for `not_found_error`
+    /// unreachable.
+    #[test]
+    fn an_explained_model_not_found_passes_through_unchanged() {
+        let explained = crate::anthropic::explain_model_not_found(
+            "claude-sonnet-4-6",
+            true,
+            true,
+            OpenAIError::ApiError(ApiError {
+                message: "model: claude-sonnet-4-6".to_string(),
+                r#type: Some("not_found_error".to_string()),
+                param: None,
+                code: None,
+            }),
+        );
+        let OpenAIError::ApiError(before) = &explained else {
+            panic!("the explanation must stay an ApiError");
+        };
+        let expected = before.message.clone();
+
+        let OpenAIError::ApiError(after) = format_anthropic_stream_error(explained) else {
+            panic!("formatting must not change the error variant");
+        };
+
+        assert_eq!(after.message, expected);
+        assert_eq!(after.r#type.as_deref(), Some("not_found_error"));
+    }
+
+    /// The `type` decides, and a message is never consulted when there is one. An
+    /// `invalid_request_error` echoes the caller's own request detail back, which is the shape a
+    /// message test reads wrong — it must classify the same whatever that detail happens to say.
+    #[test]
+    fn a_typed_error_is_never_classified_from_its_message() {
+        for message in [
+            "tools.0.name: `lookup_429` is invalid",
+            "messages.0.content.0.text: expected a string, got 403",
+            "system: the prompt may not ask for too many requests",
+        ] {
+            assert_eq!(
+                classify_stream_error(&ApiError {
+                    message: message.to_string(),
+                    r#type: Some("invalid_request_error".to_string()),
+                    param: None,
+                    code: None,
+                }),
+                StreamErrorKind::Other,
+                "{message}"
+            );
+        }
+    }
+
+    /// A model id whose snapshot date contains `403` is what makes the pass-through above
+    /// load-bearing rather than cosmetic: without it the explanation is replaced by a generic
+    /// one, and an error carrying no `type` at all falls to the message tests, where such an id
+    /// reads as a credential failure.
+    #[test]
+    fn a_model_id_containing_403_is_not_reported_as_an_auth_failure() {
+        let explained = crate::anthropic::explain_model_not_found(
+            "claude-3-5-sonnet-20240403",
+            false,
+            true,
+            OpenAIError::ApiError(ApiError {
+                message: "model: claude-3-5-sonnet-20240403".to_string(),
+                r#type: Some("not_found_error".to_string()),
+                param: None,
+                code: None,
+            }),
+        );
+
+        let OpenAIError::ApiError(after) = format_anthropic_stream_error(explained) else {
+            panic!("formatting must not change the error variant");
+        };
+
+        assert!(
+            after.message.contains("does not serve that model id"),
+            "the model-not-found explanation must survive: {}",
+            after.message
+        );
+        assert!(
+            !after.message.contains("authentication failed"),
+            "a model id is not a credential problem: {}",
+            after.message
+        );
+    }
 }

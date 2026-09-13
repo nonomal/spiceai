@@ -35,14 +35,23 @@ impl From<Arc<View>> for ViewRefreshTask {
 impl ScheduledTask for ViewRefreshTask {
     async fn execute(&self) -> Result<()> {
         let view = Arc::clone(&self.0);
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %view.name.to_string());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "acceleration_refresh", input = %view.name.to_string());
         async {
             let runtime = Arc::clone(&view.runtime);
 
             match runtime.datafusion().refresh_table(&view.name, None).await {
-                Ok(notifier) => {
-                    if let Some(notifier) = notifier {
-                        notifier.notified().await;
+                Ok(completion) => {
+                    if let Some(completion) = completion
+                        && completion.wait().await.is_abandoned()
+                    {
+                        // The view was removed while its scheduled refresh was
+                        // in flight. As for datasets, the task acts on nothing
+                        // after the wait, so this is recorded rather than
+                        // raised.
+                        let view_name = &view.name;
+                        tracing::debug!(
+                            "{view_name} was removed before its scheduled refresh completed."
+                        );
                     }
                     Ok(())
                 }

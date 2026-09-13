@@ -1,5 +1,8 @@
 name: 'CodeQL'
 
+# Security scanner: runs on push to trunk/release + a weekly schedule (and manual
+# dispatch), deliberately NOT in the merge queue — it isn't a required merge gate
+# and would add scan latency to every queue entry.
 on:
   workflow_dispatch:
   push:
@@ -13,7 +16,9 @@ on:
 jobs:
   analyze:
     name: Analyze
-    runs-on: self-hosted
+    runs-on: spiceai-dev-runners
+    env:
+      HAS_TEST_MINIO_SECRET: ${{ secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     permissions:
       actions: read
       contents: read
@@ -22,18 +27,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: ['go', 'rust']
-        # CodeQL supports [ 'cpp', 'csharp', 'go', 'java', 'javascript', 'python' ]
+        language: ['rust']
+        # CodeQL supports [ 'cpp', 'csharp', 'go', 'java', 'javascript', 'python', 'rust' ]
         # Learn more:
         # https://docs.github.com/en/free-pro-team@latest/github/finding-security-vulnerabilities-and-errors-in-your-code/configuring-code-scanning#changing-the-languages-that-are-analyzed
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up sccache with local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       # Initializes the CodeQL tools for scanning.
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
         with:
           languages: ${{ matrix.language }}
           # If you wish to specify custom queries, you can do so here or in a config file.
@@ -41,10 +56,18 @@ jobs:
           # Prefix the list here with "+" to use these queries and those in the config file.
           # queries: ./path/to/local/query, your-org/your-repo/queries@main
 
+      - name: Set up make
+        if: runner.os != 'macOS'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: runner.os != 'macOS'
+        uses: ./.github/actions/setup-cc
+
       # Autobuild attempts to build any compiled languages  (C/C++, C#, or Java).
       # If this step fails, then you should remove it and run the build manually (see below)
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
+        uses: github/codeql-action/autobuild@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
 
       # ℹ️ Command-line programs to run using the OS shell.
       # 📚 https://git.io/JvXDl
@@ -57,5 +80,14 @@ jobs:
       #   make bootstrap
       #   make release
 
+      - name: Show sccache stats
+        if: always() && (env.HAS_TEST_MINIO_SECRET == 'true')
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4

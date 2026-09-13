@@ -161,13 +161,13 @@ impl Default for FibonacciBackoffBuilder {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn duration_to_nanos(d: Duration) -> f64 {
     d.as_secs() as f64 * 1_000_000_000.0 + f64::from(d.subsec_nanos())
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_sign_loss)]
 fn nanos_to_duration(nanos: f64) -> Duration {
     let secs = nanos / 1_000_000_000.0;
     let nanos = nanos as u64 % 1_000_000_000;
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_zero_randomization_factor() {
-        let interval = Duration::from_millis(1000);
+        let interval = Duration::from_secs(1);
         let factor = 0.0;
         let random = 0.5;
         let result = get_random_value_from_interval(factor, random, interval);
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_max_duration_clamping() {
-        let max_duration = Duration::from_millis(2000);
+        let max_duration = Duration::from_secs(2);
         let mut backoff = FibonacciBackoffBuilder::new()
             .max_duration(Some(max_duration))
             .build();

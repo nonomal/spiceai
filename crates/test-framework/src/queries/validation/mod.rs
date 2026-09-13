@@ -24,11 +24,11 @@ use anyhow::{Result, anyhow};
 
 use arrow::{
     array::{
-        Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-        Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-        StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-        UInt64Array,
+        Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
     },
     csv::reader::Format,
     datatypes::TimeUnit,
@@ -39,11 +39,50 @@ use arrow::{
 };
 use chrono::{DateTime, NaiveDate};
 
+use arrow_tools::schema::schema_difference;
+
 use super::Query;
+
+pub mod sort_order;
+
+pub use sort_order::{
+    SortKeyColumn, SortKeyResolution, SortOrderViolation, has_top_level_limit,
+    has_top_level_order_by, resolve_sort_key,
+};
+
+// Not re-exported: the outcome type is plumbing between this module and
+// `sort_order`. Callers consume the reasons via `SortCheckedComparison`.
+use sort_order::SortCheck;
+
+/// A content comparison plus what the row-order check could and could not cover.
+///
+/// `unchecked` exists so a coverage hole cannot masquerade as a pass. A skipped
+/// or partial sort check leaves `result` at whatever the content comparison said
+/// — the rows really were compared — while naming the part of the `ORDER BY`
+/// nobody verified, for the caller to count and report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortCheckedComparison {
+    pub result: QueryValidationResult,
+    /// One entry per side whose `ORDER BY` was not fully verified.
+    pub unchecked: Vec<String>,
+}
+
+impl SortCheckedComparison {
+    /// True when the content matched *and* the whole `ORDER BY` was verified.
+    #[must_use]
+    pub fn is_fully_verified_pass(&self) -> bool {
+        self.result == QueryValidationResult::Pass && self.unchecked.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValidationFailReason {
     NoExpectedAnswer,
+    /// A static TPCH answer exists for the query, but only at scale factor 1.0.
+    /// Validating at any other scale factor requires a configured reference
+    /// schema, so this is reported distinctly from [`Self::NoExpectedAnswer`]
+    /// (which means no expected answer exists for the query at all).
+    NoExpectedAnswerAtScaleFactor,
     NoAnswer,
     SchemaMismatch,
     RowCountMismatch {
@@ -60,6 +99,13 @@ pub enum QueryValidationFailReason {
         column_name: String,
         left_len: usize,
         right_len: usize,
+    },
+    /// One engine returned rows that do not honor the query's own top-level
+    /// `ORDER BY`. Reported per side, because it is a property of that engine's
+    /// output rather than of the two results' relationship.
+    SortOrderViolation {
+        side: String,
+        violation: SortOrderViolation,
     },
 }
 
@@ -83,7 +129,7 @@ macro_rules! generate_tpch_answers {
 }
 
 static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::new(|| {
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     {
         let mut map = BTreeMap::new();
         // Load TPCH answers from CSV files, into RecordBatches
@@ -125,32 +171,84 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
     }
 });
 
-fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
-    if expected_type == actual_type {
+#[must_use]
+pub(crate) fn has_static_tpch_answer(query: &Query) -> bool {
+    TPCH_ANSWERS.contains_key(&query.name)
+}
+
+#[must_use]
+pub fn should_validate_with_static_tpch_answer(query: &Query, scale_factor: f64) -> bool {
+    (scale_factor - 1.0).abs() < f64::EPSILON && has_static_tpch_answer(query)
+}
+
+/// True for a `Date32`/`Date64` against a timezone-free `Timestamp`, in either
+/// order. Oracle's `DATE` is a datetime, so a date column arrives as a
+/// `Timestamp`.
+fn is_date_and_timestamp_pair(left: &DataType, right: &DataType) -> bool {
+    matches!(
+        (left, right),
+        (
+            DataType::Date32 | DataType::Date64,
+            DataType::Timestamp(_, None)
+        ) | (
+            DataType::Timestamp(_, None),
+            DataType::Date32 | DataType::Date64
+        )
+    )
+}
+
+fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool {
+    if expected_type == actual_type || is_date_and_timestamp_pair(expected_type, actual_type) {
         return true;
     }
 
     // Check for logical equivalence, with a lenient set of rules
     // E.g. a number could be returned as a string, number, or float.
-    matches!(
-        (expected_type, actual_type),
-        (DataType::Float32, DataType::Float64)
-            | (
-                DataType::Float64 | DataType::Int64,
-                DataType::Decimal128(_, _)
+    match (expected_type, actual_type) {
+        // Handle timestamp timezone differences
+        (DataType::Timestamp(unit1, tz1), DataType::Timestamp(unit2, tz2)) => {
+            // Same time unit is required
+            if unit1 != unit2 {
+                return false;
+            }
+            // Allow timezone differences between None and Some("UTC")
+            matches!(
+                (tz1.as_deref(), tz2.as_deref()),
+                (None, Some("UTC" | "+00:00")) | (Some("UTC" | "+00:00"), None)
             )
-            | (DataType::Int32, DataType::Int64)
-            | (
-                DataType::Int64,
-                DataType::Int32
-                    | DataType::Float64
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View
-            )
-            | (DataType::Utf8, DataType::LargeUtf8)
-            | (DataType::LargeUtf8, DataType::Utf8)
-    )
+        }
+        // Existing numeric and string type equivalences
+        _ => matches!(
+            (expected_type, actual_type),
+            (DataType::Float32, DataType::Float64)
+                | (DataType::Float64 | DataType::Int32, DataType::Int64)
+                | (
+                    DataType::Float64 | DataType::Int64,
+                    DataType::Decimal128(_, _)
+                )
+                | (
+                    DataType::Decimal128(_, _),
+                    DataType::Float64 | DataType::Int64
+                )
+                | (
+                    DataType::Int64,
+                    DataType::Int32
+                        | DataType::Int8
+                        | DataType::Float64
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Utf8View
+                )
+                | (DataType::Utf8, DataType::LargeUtf8 | DataType::Utf8View)
+                | (DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8)
+                | (DataType::LargeUtf8, DataType::Utf8)
+                | (
+                    DataType::Date32,
+                    DataType::Date64 | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                )
+                | (DataType::Date64, DataType::Date32)
+        ),
+    }
 }
 
 fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) -> bool {
@@ -162,7 +260,7 @@ fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) ->
         .fields()
         .iter()
         .zip(actual_schema.fields().iter())
-        .all(|(f1, f2)| datatype_equivalent(f1.data_type().clone(), f2.data_type().clone()))
+        .all(|(f1, f2)| datatype_equivalent(f1.data_type(), f2.data_type()))
 }
 
 macro_rules! downcast_and_stringify {
@@ -211,7 +309,8 @@ macro_rules! downcast_and_stringify_ts {
 /// - `Err(anyhow::Error)`: If there is an error (e.g., invalid index, failed downcast).
 ///
 /// # Example:
-/// ```
+/// ```rust,ignore
+/// use arrow::array::Int64Array;
 /// let array = Int64Array::from(vec![12345]);
 /// let result = array_value_to_string(&array, 0);
 /// assert_eq!(result.unwrap(), Some("12345".to_string()));
@@ -223,7 +322,6 @@ macro_rules! downcast_and_stringify_ts {
 /// - If the function fails to downcast the array to the expected type (e.g., if the array's type is
 ///   mismatched), it will return an error.
 /// - If the array's data type is not supported for conversion, `None` is returned.
-#[allow(clippy::too_many_lines)]
 pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<String>> {
     if array.len() <= index {
         return Err(anyhow!("Index out of bounds: {index} >= {}", array.len()));
@@ -234,6 +332,9 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
     }
 
     match array.data_type() {
+        // Entirely-null columns (e.g. CSV import of all-`\\N` field) collapse to
+        // Arrow `Null` — every cell is null.
+        DataType::Null => Ok(None),
         DataType::Int64 => downcast_and_stringify!(array, index, Int64Array),
         DataType::Int32 => downcast_and_stringify!(array, index, Int32Array),
         DataType::Int16 => downcast_and_stringify!(array, index, Int16Array),
@@ -258,6 +359,20 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
             let date = NaiveDate::from_ymd_opt(1970, 1, 1)
                 .ok_or_else(|| anyhow!("Invalid base date"))?
                 .checked_add_signed(chrono::Duration::days(i64::from(days)))
+                .ok_or_else(|| anyhow!("Date out of range"))?;
+            Ok(Some(date.format("%Y-%m-%d").to_string()))
+        }
+
+        DataType::Date64 => {
+            let millis = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| anyhow!("Failed to downcast Date64 array"))?
+                .value(index);
+            let days = millis / 86_400_000; // Convert milliseconds to days
+            let date = NaiveDate::from_ymd_opt(1970, 1, 1)
+                .ok_or_else(|| anyhow!("Invalid base date"))?
+                .checked_add_signed(chrono::Duration::days(days))
                 .ok_or_else(|| anyhow!("Date out of range"))?;
             Ok(Some(date.format("%Y-%m-%d").to_string()))
         }
@@ -291,6 +406,40 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
             }
         }
 
+        DataType::Decimal256(_, scale) => {
+            let val = array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| anyhow!("Failed to downcast Decimal256 array"))?
+                .value(index);
+
+            // `i256::to_string()` renders the full signed integer; split it into
+            // integer/fractional parts by the declared scale, mirroring the
+            // Decimal128 arm. Working from the string sidesteps i256 abs/compare
+            // APIs and preserves the exact digits. A `MySQL` `SUM(..)` widens to
+            // DECIMAL(65, s) -> Arrow Decimal256(76, s); this renders the same
+            // string the Int64/Decimal128 side produces, so the values compare
+            // equal (scale 0 -> integer string; scale s -> s fractional digits).
+            let str_signed = val.to_string();
+            let sign = if str_signed.starts_with('-') { "-" } else { "" };
+            let abs_str = str_signed.strip_prefix('-').unwrap_or(&str_signed);
+            let scale = usize::try_from(*scale)?;
+
+            let len = abs_str.len();
+            let (int_part, frac_part) = if len > scale {
+                let (a, b) = abs_str.split_at(len - scale);
+                (a.to_string(), b.to_string())
+            } else {
+                ("0".to_string(), format!("{abs_str:0>scale$}"))
+            };
+
+            if frac_part.is_empty() {
+                Ok(Some(format!("{sign}{int_part}")))
+            } else {
+                Ok(Some(format!("{sign}{int_part}.{frac_part}")))
+            }
+        }
+
         DataType::Timestamp(unit, _) => match unit {
             TimeUnit::Second => {
                 let ts = array
@@ -299,7 +448,7 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
                     .ok_or_else(|| anyhow!("Failed to downcast TimestampSecondArray"))?
                     .value(index);
                 let dt = DateTime::from_timestamp(ts, 0)
-                    .ok_or_else(|| anyhow!("Invalid timestamp for seconds={}", ts))?;
+                    .ok_or_else(|| anyhow!("Invalid timestamp for seconds={ts}"))?;
                 Ok(Some(dt.format("%Y-%m-%d %H:%M:%S").to_string()))
             }
             TimeUnit::Millisecond => {
@@ -353,11 +502,14 @@ pub fn validate_batches_as_strings(
         let data_type = field.data_type();
         let expected_array = expected.column(i).as_ref();
         let actual_array = actual.column(i).as_ref();
+        // Stringified values lose their type, so the midnight normalization below
+        // is limited to the columns it is meant for.
+        let date_vs_timestamp = is_date_and_timestamp_pair(data_type, actual_array.data_type());
 
         if expected_array.len() != actual_array.len() {
             return Ok(QueryValidationResult::Fail(
                 QueryValidationFailReason::ColumnLengthMismatch {
-                    column_name: column_name.clone(),
+                    column_name,
                     left_len: expected_array.len(),
                     right_len: actual_array.len(),
                 },
@@ -373,7 +525,7 @@ pub fn validate_batches_as_strings(
                 (Some(val), None) => {
                     return Ok(QueryValidationResult::Fail(
                         QueryValidationFailReason::DataMismatch {
-                            column: column_name.clone(),
+                            column: column_name,
                             row_number: row + 1, // indexes are 0-based, counts are 1-based
                             expected: format!("{val:?}"),
                             actual: "None".to_string(),
@@ -383,7 +535,7 @@ pub fn validate_batches_as_strings(
                 (None, Some(val)) => {
                     return Ok(QueryValidationResult::Fail(
                         QueryValidationFailReason::DataMismatch {
-                            column: column_name.clone(),
+                            column: column_name,
                             row_number: row + 1, // indexes are 0-based, counts are 1-based
                             expected: "None".to_string(),
                             actual: format!("{val:?}"),
@@ -406,9 +558,22 @@ pub fn validate_batches_as_strings(
                             }
                         }
 
+                        // Timestamp strings may differ only in fractional-second
+                        // padding (ns vs us engines). Treat equal after stripping
+                        // trailing fractional zeros.
+                        if timestamp_strings_equivalent(&expected_val, &actual_val) {
+                            continue;
+                        }
+
+                        if date_vs_timestamp
+                            && date_and_midnight_timestamp_equivalent(&expected_val, &actual_val)
+                        {
+                            continue;
+                        }
+
                         return Ok(QueryValidationResult::Fail(
                             QueryValidationFailReason::DataMismatch {
-                                column: column_name.clone(),
+                                column: column_name,
                                 row_number: row + 1, // indexes are 0-based, counts are 1-based
                                 expected: format!("{expected_val:?}"),
                                 actual: format!("{actual_val:?}"),
@@ -462,8 +627,12 @@ pub fn validate_tpch_query(
     };
 
     if !equivalent_schemas(&expected_schema, &actual_schema) {
-        println!("expected_schema: {expected_schema:?}");
-        println!("actual_schema: {actual_schema:?}");
+        if let Some(diff) = schema_difference(&expected_schema, &actual_schema) {
+            println!("Schema mismatch:\n{diff}");
+        } else {
+            println!("expected_schema: {expected_schema:?}");
+            println!("actual_schema: {actual_schema:?}");
+        }
 
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::SchemaMismatch,
@@ -488,18 +657,678 @@ pub fn validate_tpch_query(
     validate_batches_as_strings(&expected_batches, &actual_batches)
 }
 
+pub fn validate_tpch_query_at_scale(
+    query: &Query,
+    batches: &[RecordBatch],
+    scale_factor: f64,
+) -> Result<QueryValidationResult> {
+    if has_static_tpch_answer(query)
+        && !should_validate_with_static_tpch_answer(query, scale_factor)
+    {
+        // A static answer exists, but only at scale factor 1.0. Report this
+        // distinctly from `NoExpectedAnswer` so callers can tell the query has a
+        // known SF=1 answer and that validating at this scale factor needs a
+        // reference schema instead.
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswerAtScaleFactor,
+        ));
+    }
+
+    validate_tpch_query(query, batches)
+}
+
+/// Validate a query against expected results from a custom query set
+/// This is a generic validation function that can be used for custom queries
+pub fn validate_with_expected_batches(
+    query_name: &str,
+    actual_batches: &[RecordBatch],
+    expected_batches: &[RecordBatch],
+) -> Result<QueryValidationResult> {
+    if expected_batches.is_empty() && actual_batches.is_empty() {
+        return Ok(QueryValidationResult::Pass);
+    }
+
+    if expected_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    }
+
+    if actual_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    }
+
+    let Some(expected_schema) = expected_batches
+        .first()
+        .map(arrow::array::RecordBatch::schema)
+    else {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    };
+
+    let Some(actual_schema) = actual_batches
+        .first()
+        .map(arrow::array::RecordBatch::schema)
+    else {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    };
+
+    if !equivalent_schemas(&expected_schema, &actual_schema) {
+        println!("Query '{query_name}' schema mismatch:");
+        if let Some(diff) = schema_difference(&expected_schema, &actual_schema) {
+            println!("{diff}");
+        } else {
+            println!("  expected_schema: {expected_schema:?}");
+            println!("  actual_schema: {actual_schema:?}");
+        }
+
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::SchemaMismatch,
+        ));
+    }
+
+    // combine all expected batches and all actual batches into a single RecordBatch
+    let expected_batches = arrow::compute::concat_batches(&expected_schema, expected_batches)?;
+    let actual_batches = arrow::compute::concat_batches(&actual_schema, actual_batches)?;
+
+    // check the row counts are equal
+    if expected_batches.num_rows() != actual_batches.num_rows() {
+        println!("Query '{query_name}' row count mismatch:");
+        println!("  expected: {}", expected_batches.num_rows());
+        println!("  actual: {}", actual_batches.num_rows());
+
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: expected_batches.num_rows(),
+                actual: actual_batches.num_rows(),
+            },
+        ));
+    }
+
+    validate_batches_as_strings(&expected_batches, &actual_batches)
+}
+
+/// Validate that actual batches have the expected row count
+pub fn validate_row_count(
+    query_name: &str,
+    actual_batches: &[RecordBatch],
+    expected_row_count: usize,
+) -> Result<QueryValidationResult> {
+    let actual_row_count: usize = actual_batches.iter().map(RecordBatch::num_rows).sum();
+
+    if actual_row_count == expected_row_count {
+        Ok(QueryValidationResult::Pass)
+    } else {
+        println!("Query '{query_name}' row count mismatch:");
+        println!("  expected: {expected_row_count}");
+        println!("  actual: {actual_row_count}");
+
+        Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: expected_row_count,
+                actual: actual_row_count,
+            },
+        ))
+    }
+}
+
+/// True when `s` matches `shape`, where `#` marks a digit and every other byte
+/// is a literal at that offset.
+fn matches_shape(s: &str, shape: &[u8]) -> bool {
+    s.len() == shape.len()
+        && s.bytes().zip(shape).all(|(c, &want)| {
+            if want == b'#' {
+                c.is_ascii_digit()
+            } else {
+                c == want
+            }
+        })
+}
+
+/// True when one string is a plain date and the other is that date at midnight:
+/// the answer set's `1995-03-05` against the `1995-03-05 00:00:00` an engine
+/// whose `DATE` carries a time component (Oracle) returns.
+///
+/// Only midnight matches. A non-midnight time is a real difference in the data.
+fn date_and_midnight_timestamp_equivalent(a: &str, b: &str) -> bool {
+    /// Exactly `YYYY-MM-DD`, the form [`array_value_to_string`] emits for a date.
+    fn is_date(s: &str) -> bool {
+        matches_shape(s, b"####-##-##")
+    }
+
+    /// The date part of a `YYYY-MM-DD 00:00:00` timestamp, fractional second
+    /// permitted only if zero. `None` for anything else.
+    fn midnight_date(s: &str) -> Option<&str> {
+        let (date, time) = s.split_once(' ')?;
+        if !is_date(date) {
+            return None;
+        }
+        let fraction = time.strip_prefix("00:00:00")?;
+        let fraction_is_zero = match fraction.strip_prefix('.') {
+            Some(digits) => !digits.is_empty() && digits.bytes().all(|c| c == b'0'),
+            None => fraction.is_empty(),
+        };
+        fraction_is_zero.then_some(date)
+    }
+
+    match (is_date(a), is_date(b)) {
+        (true, false) => midnight_date(b) == Some(a),
+        (false, true) => midnight_date(a) == Some(b),
+        _ => false,
+    }
+}
+
+/// True when both strings are timestamps in the format [`array_value_to_string`]
+/// emits and differ only by fractional-second zero padding — a nanosecond engine's
+/// `2024-01-01 00:00:00.000000000` against a microsecond engine's
+/// `2024-01-01 00:00:00.000000`.
+///
+/// The shape test is deliberately exact rather than a "contains `.` and `:`"
+/// heuristic: a loose guard also matches values such as `http://host/a.100`, where
+/// trimming trailing zeros would silently mask a real mismatch. Anything that is
+/// not the emitted timestamp format returns `false`, so the caller falls through
+/// to reporting the mismatch.
+fn timestamp_strings_equivalent(a: &str, b: &str) -> bool {
+    /// Exactly `YYYY-MM-DD HH:MM:SS`, the prefix [`array_value_to_string`] emits
+    /// for every `Timestamp` unit.
+    fn is_timestamp_prefix(s: &str) -> bool {
+        matches_shape(s, b"####-##-## ##:##:##")
+    }
+
+    /// Splits into the `YYYY-MM-DD HH:MM:SS` prefix and its fractional digits with
+    /// trailing zeros trimmed. `None` when `s` is not the emitted format.
+    fn split_timestamp(s: &str) -> Option<(&str, &str)> {
+        match s.split_once('.') {
+            Some((prefix, frac)) => {
+                let frac_is_digits = !frac.is_empty() && frac.bytes().all(|c| c.is_ascii_digit());
+                (is_timestamp_prefix(prefix) && frac_is_digits)
+                    .then(|| (prefix, frac.trim_end_matches('0')))
+            }
+            None => is_timestamp_prefix(s).then_some((s, "")),
+        }
+    }
+
+    match (split_timestamp(a), split_timestamp(b)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// How rows should be compared when validating two independent query results.
+///
+/// SQL without `ORDER BY` does not define row order, so engines may return the
+/// same multiset of rows in different orders. [`RowOrder::Multiset`] sorts both
+/// sides into a canonical order before cell-by-cell comparison.
+/// [`RowOrder::Preserved`] requires identical row order (use when the SQL has
+/// an explicit `ORDER BY` that both engines honor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowOrder {
+    /// Sort both results lexicographically by all columns, then compare.
+    #[default]
+    Multiset,
+    /// Compare rows in the order returned (for `ORDER BY` queries).
+    Preserved,
+}
+
+/// Infer [`RowOrder`] from SQL text: presence of `ORDER BY` (case-insensitive)
+/// means preserved order; otherwise multiset. Comments are not stripped — the
+/// inventory queries do not put `ORDER BY` only inside comments.
+#[must_use]
+pub fn row_order_from_sql(sql: &str) -> RowOrder {
+    let upper = sql.to_ascii_uppercase();
+    if upper.contains("ORDER BY") {
+        RowOrder::Preserved
+    } else {
+        RowOrder::Multiset
+    }
+}
+
+/// Full-content equality of two independent result sets (schema + cell values).
+///
+/// This is the engine-vs-engine parity path: both sides are treated as "actual"
+/// answers for the same SQL on the same data. Numeric comparison reuses the
+/// relative tolerance in [`validate_batches_as_strings`].
+///
+/// When `row_order` is [`RowOrder::Multiset`], both sides are concatenated and
+/// sorted into a canonical order so differing physical scan orders do not
+/// produce false mismatches — which means this function says **nothing about the
+/// order an engine returned rows in**. Engine-parity callers want
+/// [`compare_query_result_batches_with_sort_check`], which adds that check; this
+/// one is the content half, kept separate so its own behavior stays testable.
+pub fn compare_query_result_batches(
+    query_name: &str,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    row_order: RowOrder,
+) -> Result<QueryValidationResult> {
+    if left_batches.is_empty() && right_batches.is_empty() {
+        return Ok(QueryValidationResult::Pass);
+    }
+
+    if left_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    }
+
+    if right_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    }
+
+    let Some(left_schema) = left_batches.first().map(RecordBatch::schema) else {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    };
+    let Some(right_schema) = right_batches.first().map(RecordBatch::schema) else {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    };
+
+    // Engine-vs-engine parity cares about cell values, not Arrow physical types
+    // (Utf8View vs Utf8, Decimal128 vs Float64, qualified vs bare aggregate
+    // names). Require the same arity; stringified comparison below absorbs type
+    // representation differences the way `validate_batches_as_strings` already
+    // does for TPCH CSV answers.
+    if left_schema.fields().len() != right_schema.fields().len() {
+        println!("Query '{query_name}' schema arity mismatch (left vs right):");
+        if let Some(diff) = schema_difference(&left_schema, &right_schema) {
+            println!("{diff}");
+        } else {
+            println!("  left_schema: {left_schema:?}");
+            println!("  right_schema: {right_schema:?}");
+        }
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::SchemaMismatch,
+        ));
+    }
+    if !equivalent_schemas(&left_schema, &right_schema) {
+        // Log but continue — positional string compare still validates content.
+        if let Some(diff) = schema_difference(&left_schema, &right_schema) {
+            println!(
+                "Query '{query_name}' logical schema differs (continuing value compare):\n{diff}"
+            );
+        }
+    }
+
+    let mut left = arrow::compute::concat_batches(&left_schema, left_batches)?;
+    let mut right = arrow::compute::concat_batches(&right_schema, right_batches)?;
+
+    if left.num_rows() != right.num_rows() {
+        println!("Query '{query_name}' row count mismatch:");
+        println!("  left: {}", left.num_rows());
+        println!("  right: {}", right.num_rows());
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: left.num_rows(),
+                actual: right.num_rows(),
+            },
+        ));
+    }
+
+    if row_order == RowOrder::Multiset {
+        left = sort_batch_lexicographic_as_strings(&left)?;
+        right = sort_batch_lexicographic_as_strings(&right)?;
+    }
+
+    // `validate_batches_as_strings` compares expected (first arg) to actual
+    // (second). For engine-vs-engine parity the labels are arbitrary; left is
+    // treated as the reference side in mismatch messages.
+    let result = validate_batches_as_strings(&left, &right)?;
+    if let QueryValidationResult::Fail(ref reason) = result {
+        println!("Query '{query_name}' content mismatch: {reason:?}");
+    }
+    Ok(result)
+}
+
+/// Content equality **plus** a per-side check that each engine honored the
+/// query's own top-level `ORDER BY`.
+///
+/// [`compare_query_result_batches`] under [`RowOrder::Multiset`] canonically
+/// sorts both sides before comparing, so it establishes that the two engines
+/// returned the same rows and nothing about the order they returned them in.
+/// Most of the suite corpus sorts without a `LIMIT` and is compared that way, so
+/// without this check an engine whose sort is wrong compares equal.
+///
+/// A side that breaks its own `ORDER BY` is reported as that, in preference to
+/// the content difference it also causes. Under [`RowOrder::Preserved`] —
+/// `ORDER BY … LIMIT`, where the set of rows depends on the order — the same
+/// rows in the wrong order fail as a content mismatch, which says the two
+/// results differ without naming the side that is wrong on its own terms. A
+/// caller adjudicating a disagreement between engines needs that distinction:
+/// a content difference may come from dialect or arithmetic, a sort violation
+/// cannot. When no side violates, the content result stands.
+///
+/// A tie under the sort key is never a violation, so the check adds no
+/// sensitivity to the engine-dependent ordering of equal rows that
+/// [`RowOrder::Multiset`] exists to absorb.
+///
+/// **A sort check that could not run is returned, not swallowed.** Whatever the
+/// check could not cover lands in [`SortCheckedComparison::unchecked`], because
+/// a hole that reads as a pass is the failure this check exists to remove. A
+/// caller that ignores that field is back to reporting unverified order as
+/// verified. The field is populated even when the content comparison failed, for
+/// the caller that recovers from that failure and would otherwise pass an order
+/// nothing verified.
+///
+/// `sql` must be the statement that produced *both* result sets. Where the two
+/// engines run textually different SQL, pass the form whose projection matches
+/// the compared results.
+///
+/// # Errors
+/// Returns an error if the batches cannot be concatenated or compared.
+pub fn compare_query_result_batches_with_sort_check(
+    query_name: &str,
+    sql: &str,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    row_order: RowOrder,
+) -> Result<SortCheckedComparison> {
+    let content = if row_order == RowOrder::Preserved {
+        compare_limit_results_allowing_cutoff_ties(query_name, sql, left_batches, right_batches)?
+    } else {
+        compare_query_result_batches(query_name, left_batches, right_batches, row_order)?
+    };
+    let content_passed = content == QueryValidationResult::Pass;
+
+    // Parsed once for both sides: the AST does not depend on which engine's rows
+    // are being checked, and the corpus carries multi-kilobyte statements.
+    let statement = sort_order::parse_one_statement(sql);
+    let mut unchecked = Vec::new();
+
+    for (side, batches) in [("left", left_batches), ("right", right_batches)] {
+        let Some(schema) = batches.first().map(RecordBatch::schema) else {
+            continue;
+        };
+        let batch = arrow::compute::concat_batches(&schema, batches)?;
+        match sort_order::check_sort_order_parsed(statement.as_ref(), &batch)? {
+            SortCheck::Ordered => {}
+            SortCheck::PartiallyOrdered { unchecked: reason } | SortCheck::Skipped { reason } => {
+                println!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
+                unchecked.push(format!("{side}: {reason}"));
+            }
+            SortCheck::Violation(v) => {
+                println!(
+                    "Query '{query_name}' ({side}) violates its own ORDER BY on column '{}' at row {}: {} then {}",
+                    v.column, v.row_number, v.previous, v.current
+                );
+                return Ok(SortCheckedComparison {
+                    result: QueryValidationResult::Fail(
+                        QueryValidationFailReason::SortOrderViolation {
+                            side: side.to_string(),
+                            violation: v,
+                        },
+                    ),
+                    unchecked,
+                });
+            }
+        }
+    }
+
+    if !content_passed {
+        // The hole is carried even though the comparison failed, because not
+        // every caller treats that failure as final: one that recovers from it
+        // — the chDB lane retries a schema mismatch as string rows — would
+        // otherwise turn an order that was never verified into a clean pass.
+        return Ok(SortCheckedComparison {
+            result: content,
+            unchecked,
+        });
+    }
+
+    Ok(SortCheckedComparison {
+        result: QueryValidationResult::Pass,
+        unchecked,
+    })
+}
+
+/// Compare an under-test result to a live reference-schema result.
+///
+/// This is the `--validate` path for query sets that have no static answer
+/// files (TPC-DS, and TPC-H at scale factors other than 1): both sides are
+/// treated as engine answers for the same SQL on the same data. Row order
+/// follows the Cayenne correctness suite: positional equality only when the
+/// row set itself depends on order (top-level `ORDER BY` + `LIMIT`); otherwise
+/// a multiset compare so scan order cannot produce a false mismatch. A side
+/// that violates its own `ORDER BY` still fails.
+///
+/// An `ORDER BY` the sort check could not fully verify is not a failure here —
+/// the rows were still compared. Callers that need to count that hole should
+/// use [`compare_query_result_batches_with_sort_check`] directly.
+///
+/// # Errors
+/// Returns an error if the batches cannot be concatenated or compared.
+pub fn validate_against_reference_batches(
+    query: &Query,
+    actual: &[RecordBatch],
+    reference: &[RecordBatch],
+) -> Result<QueryValidationResult> {
+    let order = if has_top_level_order_by(&query.sql) && has_top_level_limit(&query.sql) {
+        RowOrder::Preserved
+    } else {
+        RowOrder::Multiset
+    };
+    let comparison = compare_query_result_batches_with_sort_check(
+        &query.name,
+        &query.sql,
+        actual,
+        reference,
+        order,
+    )?;
+    Ok(comparison.result)
+}
+
+/// Compare `ORDER BY … LIMIT` results when the sort key is not unique.
+///
+/// SQL does not define which tied rows a `LIMIT` keeps. TPC-DS Q65 orders by
+/// `s_store_name, i_item_desc`; many items share description `"A"`, so two
+/// correct engines may return different 100-row subsets. Requiring positional
+/// cell equality then fails even though both honor the `ORDER BY`.
+///
+/// Complete tie-groups (a run of equal sort keys followed by a greater key)
+/// must still match as a multiset. The last run is a cutoff only when the
+/// result filled the `LIMIT` *and* that run has more than one row — then a
+/// leftover tied row past the boundary may exist, so only the sort keys are
+/// required to match. A unique last row, or a result shorter than `LIMIT`,
+/// is compared in full: those groups were not truncated.
+fn compare_limit_results_allowing_cutoff_ties(
+    query_name: &str,
+    sql: &str,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+) -> Result<QueryValidationResult> {
+    if left_batches.is_empty() && right_batches.is_empty() {
+        return Ok(QueryValidationResult::Pass);
+    }
+    if left_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    }
+    if right_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    }
+
+    let left_schema = left_batches[0].schema();
+    let right_schema = right_batches[0].schema();
+    if left_schema.fields().len() != right_schema.fields().len() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::SchemaMismatch,
+        ));
+    }
+
+    let left = arrow::compute::concat_batches(&left_schema, left_batches)?;
+    let right = arrow::compute::concat_batches(&right_schema, right_batches)?;
+    if left.num_rows() != right.num_rows() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: left.num_rows(),
+                actual: right.num_rows(),
+            },
+        ));
+    }
+
+    let statement = sort_order::parse_one_statement(sql);
+    let resolution = statement.as_ref().map_or_else(
+        || SortKeyResolution::Unresolved {
+            reason: "SQL did not parse as a single statement".to_string(),
+        },
+        |parsed| sort_order::resolve_statement_sort_key(parsed, &left.schema()),
+    );
+    let SortKeyResolution::Resolved { key, .. } = resolution else {
+        return compare_query_result_batches(
+            query_name,
+            left_batches,
+            right_batches,
+            RowOrder::Preserved,
+        );
+    };
+
+    let n = left.num_rows();
+    let mut run_start = 0_usize;
+    while run_start < n {
+        let run_key = row_sort_key(&left, run_start, &key)?;
+        if row_sort_key(&right, run_start, &key)? != run_key {
+            println!(
+                "Query '{query_name}' ORDER BY key mismatch at row {} (left vs right cutoff)",
+                run_start + 1
+            );
+            return Ok(QueryValidationResult::Fail(
+                QueryValidationFailReason::DataMismatch {
+                    column: key[0].name.clone(),
+                    row_number: run_start + 1,
+                    expected: run_key
+                        .first()
+                        .and_then(Option::as_deref)
+                        .unwrap_or("")
+                        .to_string(),
+                    actual: row_sort_key(&right, run_start, &key)?
+                        .first()
+                        .and_then(Option::as_deref)
+                        .unwrap_or("")
+                        .to_string(),
+                },
+            ));
+        }
+        let mut run_end = run_start + 1;
+        while run_end < n && row_sort_key(&left, run_end, &key)? == run_key {
+            if row_sort_key(&right, run_end, &key)? != run_key {
+                return Ok(QueryValidationResult::Fail(
+                    QueryValidationFailReason::DataMismatch {
+                        column: key[0].name.clone(),
+                        row_number: run_end + 1,
+                        expected: run_key
+                            .first()
+                            .and_then(Option::as_deref)
+                            .unwrap_or("")
+                            .to_string(),
+                        actual: row_sort_key(&right, run_end, &key)?
+                            .first()
+                            .and_then(Option::as_deref)
+                            .unwrap_or("")
+                            .to_string(),
+                    },
+                ));
+            }
+            run_end += 1;
+        }
+        let is_last_run = run_end == n;
+        // A multi-row last group is not itself proof of LIMIT truncation:
+        // `LIMIT 100` of two tied rows still has room for both, and skipping
+        // the non-key compare would let a wrong `revenue` pass. Only a result
+        // that filled the literal `LIMIT` can have cut a tie (TPC-DS Q65).
+        let truncated_cutoff = is_last_run
+            && (run_end - run_start) > 1
+            && sort_order::top_level_limit_count(sql).is_some_and(|limit| n == limit);
+        if !truncated_cutoff {
+            let left_run = left.slice(run_start, run_end - run_start);
+            let right_run = right.slice(run_start, run_end - run_start);
+            let run_result = compare_query_result_batches(
+                query_name,
+                &[left_run],
+                &[right_run],
+                RowOrder::Multiset,
+            )?;
+            if let QueryValidationResult::Fail(reason) = run_result {
+                return Ok(QueryValidationResult::Fail(reason));
+            }
+        }
+        run_start = run_end;
+    }
+    Ok(QueryValidationResult::Pass)
+}
+
+fn row_sort_key(
+    batch: &RecordBatch,
+    row: usize,
+    key: &[SortKeyColumn],
+) -> Result<Vec<Option<String>>> {
+    let mut out = Vec::with_capacity(key.len());
+    for column in key {
+        out.push(array_value_to_string(
+            batch.column(column.index).as_ref(),
+            row,
+        )?);
+    }
+    Ok(out)
+}
+
+/// Canonical row order for multiset equality: sort by stringified cell values
+/// across all columns (same string forms used by [`validate_batches_as_strings`]).
+fn sort_batch_lexicographic_as_strings(batch: &RecordBatch) -> Result<RecordBatch> {
+    let n = batch.num_rows();
+    if n <= 1 {
+        return Ok(batch.clone());
+    }
+
+    let mut keys: Vec<(Vec<Option<String>>, usize)> = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut key = Vec::with_capacity(batch.num_columns());
+        for col in 0..batch.num_columns() {
+            key.push(array_value_to_string(batch.column(col).as_ref(), row)?);
+        }
+        keys.push((key, row));
+    }
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let indices: Vec<u32> = keys
+        .into_iter()
+        .map(|(_, i)| u32::try_from(i).map_err(|_| anyhow!("row index does not fit in u32")))
+        .collect::<Result<Vec<_>>>()?;
+    let index_array = arrow::array::UInt32Array::from(indices);
+
+    let columns: Result<Vec<_>> = batch
+        .columns()
+        .iter()
+        .map(|col| {
+            arrow::compute::take(col.as_ref(), &index_array, None)
+                .map_err(|e| anyhow!("take failed during multiset sort: {e}"))
+        })
+        .collect();
+    Ok(RecordBatch::try_new(batch.schema(), columns?)?)
+}
+
 #[cfg(test)]
-#[allow(clippy::too_many_lines)]
 mod test {
     use crate::queries::QuerySet;
 
     use super::*;
     use arrow::{
         array::{
-            Decimal128Builder, Float32Array, Int8Array, Int16Array, UInt8Array, UInt16Array,
-            UInt32Array, UInt64Array,
+            ArrayRef, Decimal128Builder, Decimal256Builder, Float32Array, Int8Array, Int16Array,
+            UInt8Array, UInt16Array, UInt32Array, UInt64Array,
         },
-        datatypes::{Field, Schema, SchemaRef},
+        datatypes::{Field, Schema, SchemaRef, i256},
     };
     use rstest::rstest;
     use std::sync::Arc;
@@ -522,6 +1351,26 @@ mod test {
             .clone();
         let schema = batches[0].schema();
         assert_eq!(schema.fields().len(), 10);
+    }
+
+    #[test]
+    fn test_static_tpch_answers_are_sf1_only() {
+        let query = Query::new("tpch_q22".into(), "SELECT 1".into(), false);
+
+        assert!(has_static_tpch_answer(&query));
+        assert!(should_validate_with_static_tpch_answer(&query, 1.0));
+        assert!(!should_validate_with_static_tpch_answer(&query, 10.0));
+        assert!(!should_validate_with_static_tpch_answer(&query, 100.0));
+
+        let batches = TPCH_ANSWERS
+            .get("tpch_q22")
+            .expect("should have q22 answer")
+            .clone();
+
+        assert_eq!(
+            validate_tpch_query_at_scale(&query, &batches, 100.0).expect("should validate"),
+            QueryValidationResult::Fail(QueryValidationFailReason::NoExpectedAnswerAtScaleFactor)
+        );
     }
 
     #[test]
@@ -587,12 +1436,14 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_correct_answer_wrong_type() {
+    #[tokio::test]
+    async fn test_correct_answer_wrong_type() {
         // Use the correct answer, but a different datatype
         // Q22 from CSV, cntrycode is Utf8. Query returns it as Int64
         let query = QuerySet::Tpch
-            .get_queries(None)
+            .get_queries(None, None, None, None)
+            .await
+            .expect("to get queries")
             .get(20)
             .expect("Should have q22")
             .clone();
@@ -672,11 +1523,13 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_wrong_answers() {
+    #[tokio::test]
+    async fn test_wrong_answers() {
         // Use the wrong answer and validate it fails
         let query = QuerySet::Tpch
-            .get_queries(None)
+            .get_queries(None, None, None, None)
+            .await
+            .expect("to get queries")
             .get(20)
             .expect("Should have q22")
             .clone();
@@ -781,6 +1634,28 @@ mod test {
             .with_precision_and_scale(38, scale)
             .expect("Should create builder");
         builder.append_value(value);
+        let array = builder.finish();
+
+        let result = array_value_to_string(&array, 0).expect("Should convert value to string");
+        assert_eq!(result, Some(expected.to_string()));
+    }
+
+    // A `MySQL` `SUM(DECIMAL)` widens to Decimal256(76, scale); ensure the i256
+    // arm renders identically to the Decimal128 arm across sign, scale 0/>0, and
+    // the scale-exceeds-digits case (fractional zero-padding).
+    #[rstest]
+    #[case(0, 12_345_i128, "12345")]
+    #[case(2, 12_345_i128, "123.45")]
+    #[case(3, 12_345_i128, "12.345")]
+    #[case(0, -12_345_i128, "-12345")]
+    #[case(2, -12_345_i128, "-123.45")]
+    #[case(6, 1_i128, "0.000001")]
+    #[case(4, -7_i128, "-0.0007")]
+    fn test_decimal256_values(#[case] scale: i8, #[case] value: i128, #[case] expected: &str) {
+        let mut builder = Decimal256Builder::new()
+            .with_precision_and_scale(76, scale)
+            .expect("Should create Decimal256 builder");
+        builder.append_value(i256::from_i128(value));
         let array = builder.finish();
 
         let result = array_value_to_string(&array, 0).expect("Should convert value to string");
@@ -961,5 +1836,444 @@ mod test {
             result.expect_err("Should return an error").to_string(),
             "Index out of bounds: 1 >= 1"
         );
+    }
+
+    #[test]
+    fn test_compare_query_result_batches_multiset_reorders() {
+        // Same multiset, different physical order — Multiset must pass; Preserved must fail.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let left = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("left batch");
+        let right = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["b", "a"])),
+                Arc::new(arrow::array::Int64Array::from(vec![2, 1])),
+            ],
+        )
+        .expect("right batch");
+
+        let multiset = compare_query_result_batches(
+            "reorder",
+            std::slice::from_ref(&left),
+            std::slice::from_ref(&right),
+            RowOrder::Multiset,
+        )
+        .expect("compare multiset");
+        assert_eq!(multiset, QueryValidationResult::Pass);
+
+        let preserved =
+            compare_query_result_batches("reorder", &[left], &[right], RowOrder::Preserved)
+                .expect("compare preserved");
+        assert!(
+            matches!(
+                preserved,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "preserved order must detect swapped rows: {preserved:?}"
+        );
+    }
+
+    #[test]
+    fn test_compare_query_result_batches_detects_value_mismatch() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let left = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("left");
+        let right = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 99]))],
+        )
+        .expect("right");
+
+        let result = compare_query_result_batches("values", &[left], &[right], RowOrder::Multiset)
+            .expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "value mismatch must fail: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_accepts_reordered_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("actual batch");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["b", "a"])),
+                Arc::new(arrow::array::Int64Array::from(vec![2, 1])),
+            ],
+        )
+        .expect("reference batch");
+
+        let query = Query::new("tpcds_q1".into(), "SELECT k, v FROM t".into(), false);
+        let result = validate_against_reference_batches(
+            &query,
+            std::slice::from_ref(&actual),
+            std::slice::from_ref(&reference),
+        )
+        .expect("compare");
+        assert_eq!(
+            result,
+            QueryValidationResult::Pass,
+            "TPC-DS queries without ORDER BY + LIMIT must compare as a multiset: {result:?}"
+        );
+    }
+
+    fn q65_tied_batches(
+        left_revenue: [&str; 2],
+        right_revenue: [&str; 2],
+    ) -> (RecordBatch, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s_store_name", arrow::datatypes::DataType::Utf8, false),
+            Field::new("i_item_desc", arrow::datatypes::DataType::Utf8, false),
+            Field::new("revenue", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["able", "able"])),
+                Arc::new(arrow::array::StringArray::from(vec!["A", "A"])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    left_revenue[0],
+                    left_revenue[1],
+                ])),
+            ],
+        )
+        .expect("actual");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["able", "able"])),
+                Arc::new(arrow::array::StringArray::from(vec!["A", "A"])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    right_revenue[0],
+                    right_revenue[1],
+                ])),
+            ],
+        )
+        .expect("reference");
+        (actual, reference)
+    }
+
+    #[test]
+    fn test_validate_against_reference_rejects_tied_rows_when_limit_is_not_filled() {
+        // LIMIT 100 of two rows cannot have truncated a tie group, so a
+        // different `revenue` is a real mismatch — not a legal LIMIT subset.
+        let (actual, reference) = q65_tied_batches(["4.63", "8.64"], ["4.40", "1.74"]);
+        let query = Query::new(
+            "tpcds_q65".into(),
+            "SELECT s_store_name, i_item_desc, revenue FROM t \
+             ORDER BY s_store_name, i_item_desc LIMIT 100"
+                .into(),
+            false,
+        );
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "a short result under LIMIT 100 must still compare non-key cells: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_accepts_tied_limit_subsets() {
+        // TPC-DS Q65: ORDER BY store name + item desc is not unique — many
+        // items share description "A". When the result fills LIMIT, the last
+        // tie group may be truncated and two engines may keep different
+        // members; both answers are SQL-correct.
+        let (actual, reference) = q65_tied_batches(["4.63", "8.64"], ["4.40", "1.74"]);
+        let query = Query::new(
+            "tpcds_q65".into(),
+            "SELECT s_store_name, i_item_desc, revenue FROM t \
+             ORDER BY s_store_name, i_item_desc LIMIT 2"
+                .into(),
+            false,
+        );
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert_eq!(
+            result,
+            QueryValidationResult::Pass,
+            "tied ORDER BY + filled LIMIT subsets must pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_rejects_unique_limit_mismatch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("actual");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 99])),
+            ],
+        )
+        .expect("reference");
+        let query = Query::new(
+            "tpcds_q1".into(),
+            "SELECT k, v FROM t ORDER BY k LIMIT 2".into(),
+            false,
+        );
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "a unique ORDER BY key must still fail on a wrong cell: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_against_reference_detects_value_mismatch() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let actual = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("actual");
+        let reference = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 99]))],
+        )
+        .expect("reference");
+
+        let query = Query::new("tpcds_q64".into(), "SELECT v FROM t".into(), false);
+        let result =
+            validate_against_reference_batches(&query, &[actual], &[reference]).expect("compare");
+        assert!(
+            matches!(
+                result,
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            ),
+            "a wrong cell must fail TPC-DS reference validation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_row_order_from_sql() {
+        assert_eq!(
+            row_order_from_sql("SELECT a FROM t ORDER BY a"),
+            RowOrder::Preserved
+        );
+        assert_eq!(
+            row_order_from_sql("select a from t order by a desc"),
+            RowOrder::Preserved
+        );
+        assert_eq!(
+            row_order_from_sql("SELECT a FROM t GROUP BY a"),
+            RowOrder::Multiset
+        );
+    }
+
+    #[test]
+    fn test_timestamp_strings_equivalent() {
+        // Same instant, different fractional-second width across engines.
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00.000000000",
+            "2024-01-01 00:00:00.000000"
+        ));
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00.123000000",
+            "2024-01-01 00:00:00.123"
+        ));
+        // A bare second-precision timestamp equals an all-zero fraction.
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00",
+            "2024-01-01 00:00:00.000"
+        ));
+        assert!(timestamp_strings_equivalent(
+            "2024-01-01 00:00:00",
+            "2024-01-01 00:00:00"
+        ));
+
+        // Genuinely different instants must never be equivalent.
+        assert!(!timestamp_strings_equivalent(
+            "2024-01-01 00:00:00.100000000",
+            "2024-01-01 00:00:00.000000"
+        ));
+        assert!(!timestamp_strings_equivalent(
+            "2024-01-01 00:00:01",
+            "2024-01-01 00:00:00"
+        ));
+        assert!(!timestamp_strings_equivalent(
+            "2024-01-02 00:00:00",
+            "2024-01-01 00:00:00"
+        ));
+
+        // Non-timestamps must not be normalized: a loose "contains `.` and `:`"
+        // guard would collapse these trailing zeros and mask a real mismatch.
+        assert!(!timestamp_strings_equivalent(
+            "http://host/a.100",
+            "http://host/a.1"
+        ));
+        assert!(!timestamp_strings_equivalent("1.100", "1.1"));
+        assert!(!timestamp_strings_equivalent("12:30.100", "12:30.1"));
+        // Decimals must fall through to the numeric comparison path.
+        assert!(!timestamp_strings_equivalent("1.10", "1.1"));
+    }
+
+    #[test]
+    fn test_date_and_midnight_timestamp_equivalent() {
+        // Either argument may be the date.
+        assert!(date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:00"
+        ));
+        assert!(date_and_midnight_timestamp_equivalent(
+            "1995-03-05 00:00:00",
+            "1995-03-05"
+        ));
+        // A zero fraction is still midnight.
+        assert!(date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:00.000"
+        ));
+
+        // Non-midnight times are real differences.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 06:00:00"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:01"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:00.001"
+        ));
+        // A different day differs even at midnight.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-06 00:00:00"
+        ));
+        // Two dates, or two timestamps, are left to the caller's other rules.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05 00:00:00",
+            "1995-03-05 00:00:00"
+        ));
+        // Anything outside the emitted format falls through.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-3-5",
+            "1995-03-05 00:00:00"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05T00:00:00"
+        ));
+    }
+
+    #[test]
+    fn test_midnight_normalization_is_limited_to_date_columns() {
+        fn compare(data_type: DataType, expected: ArrayRef, actual: ArrayRef) -> String {
+            let schema: SchemaRef =
+                Arc::new(Schema::new(vec![Field::new("value", data_type, false)]));
+            let expected = RecordBatch::try_new(Arc::clone(&schema), vec![expected])
+                .expect("expected batch should build");
+            // The actual batch carries the engine's own type for the column.
+            let actual_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                actual.data_type().clone(),
+                false,
+            )]));
+            let actual = RecordBatch::try_new(actual_schema, vec![actual])
+                .expect("actual batch should build");
+            format!(
+                "{:?}",
+                validate_batches_as_strings(&expected, &actual).expect("comparison should run")
+            )
+        }
+
+        // A date against the same date at midnight passes.
+        let result = compare(
+            DataType::Date32,
+            Arc::new(Date32Array::from(vec![9194])),
+            Arc::new(TimestampSecondArray::from(vec![794_361_600])),
+        );
+        assert!(
+            result.contains("Pass"),
+            "date vs midnight timestamp: {result}"
+        );
+
+        // The same two strings in a text column are still a mismatch.
+        let result = compare(
+            DataType::Utf8,
+            Arc::new(StringArray::from(vec!["1995-03-05"])),
+            Arc::new(StringArray::from(vec!["1995-03-05 00:00:00"])),
+        );
+        assert!(result.contains("DataMismatch"), "text column: {result}");
+    }
+
+    #[test]
+    fn test_datatype_equivalent_date_and_timestamp() {
+        // The answer set infers `Date32`; an Oracle `DATE` arrives as a
+        // second-resolution `Timestamp`.
+        assert!(datatype_equivalent(
+            &DataType::Date32,
+            &DataType::Timestamp(TimeUnit::Second, None)
+        ));
+        assert!(datatype_equivalent(
+            &DataType::Timestamp(TimeUnit::Second, None),
+            &DataType::Date32
+        ));
+        // A zoned timestamp against a date stays a mismatch.
+        assert!(!datatype_equivalent(
+            &DataType::Date32,
+            &DataType::Timestamp(TimeUnit::Second, Some("UTC".into()))
+        ));
     }
 }

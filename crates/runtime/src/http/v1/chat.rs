@@ -23,10 +23,10 @@ use std::{
 
 use crate::model::LLMChatCompletionsModelStore;
 #[cfg(feature = "openapi")]
-use async_openai::types::CreateChatCompletionResponse;
+use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
-    error::OpenAIError,
-    types::{
+    error::{OpenAIError, StreamError},
+    types::chat::{
         ChatChoice, ChatChoiceStream, ChatCompletionResponseMessage, ChatCompletionResponseStream,
         ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
         CreateChatCompletionStreamResponse, Role,
@@ -133,9 +133,7 @@ pub(crate) async fn post(
     );
     span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
 
-    if let Some(traceparent) = context.trace_parent() {
-        crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
-    }
+    crate::task_history::correlation::record_task_history_trace_id(&span, &context);
 
     let span_clone = span.clone();
     async move {
@@ -193,8 +191,8 @@ async fn handle_streaming(
         let mut events = match get_event_stream() {
             Ok(o) => o,
             Err(e) => {
-                return openai_error_to_response(OpenAIError::StreamError(format!(
-                    "An error occurred in reading progress: {e}"
+                return openai_error_to_response(OpenAIError::StreamError(Box::new(
+                    StreamError::EventStream(format!("An error occurred in reading progress: {e}")),
                 )));
             }
         };
@@ -243,7 +241,7 @@ async fn handle_streaming(
     )
 }
 
-#[allow(clippy::cast_possible_truncation, deprecated)]
+#[expect(deprecated)]
 pub(crate) fn create_working_stream_payload(
     content: String,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
@@ -390,7 +388,7 @@ mod tests {
     };
     use async_openai::{
         error::OpenAIError,
-        types::{
+        types::chat::{
             ChatCompletionResponseStream, CreateChatCompletionRequest,
             CreateChatCompletionStreamResponse,
         },

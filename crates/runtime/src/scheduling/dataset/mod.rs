@@ -35,7 +35,7 @@ impl From<Arc<Dataset>> for DatasetRefreshTask {
 impl ScheduledTask for DatasetRefreshTask {
     async fn execute(&self) -> Result<()> {
         let dataset = Arc::clone(&self.0);
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %dataset.name.to_string());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "acceleration_refresh", input = %dataset.name.to_string());
         async {
             match dataset
                 .runtime()
@@ -43,9 +43,19 @@ impl ScheduledTask for DatasetRefreshTask {
                 .refresh_table(&dataset.name, None)
                 .await
             {
-                Ok(notifier) => {
-                    if let Some(notifier) = notifier {
-                        notifier.notified().await;
+                Ok(completion) => {
+                    if let Some(completion) = completion
+                        && completion.wait().await.is_abandoned()
+                    {
+                        // The dataset was removed while its scheduled refresh
+                        // was in flight. The task acts on nothing after the
+                        // wait, so there is no phantom completion to guard
+                        // against; raising it would report a task failure on
+                        // every ordinary removal and shutdown.
+                        let dataset_name = &dataset.name;
+                        tracing::debug!(
+                            "{dataset_name} was removed before its scheduled refresh completed."
+                        );
                     }
                     Ok(())
                 }

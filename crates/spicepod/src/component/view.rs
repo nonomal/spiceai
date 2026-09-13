@@ -22,10 +22,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{Nameable, WithDependsOn, dataset::ReadyState, is_default};
-use crate::{acceleration::Acceleration, semantic::Column};
-
+use crate::{
+    acceleration::Acceleration, metadata::metadata_value_to_string, param::Params,
+    semantic::Column, vector::VectorStore,
+};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct View {
     pub name: String,
 
@@ -52,6 +55,12 @@ pub struct View {
     #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: ReadyState,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<VectorStore>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
@@ -76,19 +85,47 @@ impl View {
             acceleration: None,
             ready_state: ReadyState::default(),
             depends_on: Vec::default(),
+            vectors: None,
+            params: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_acceleration(mut self, acceleration: Acceleration) -> Self {
+        self.acceleration = Some(acceleration);
+        self
+    }
+
+    #[must_use]
+    pub fn with_sql(mut self, sql: impl Into<String>) -> Self {
+        self.sql = Some(sql.into());
+        self
     }
 
     #[must_use]
     pub fn metadata(&self) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         if let Some(d) = self.description.as_ref() {
-            metadata.insert("description".to_string(), d.to_string());
+            metadata.insert("description".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.to_string(), v.to_string());
+            metadata.insert(k.clone(), metadata_value_to_string(v));
         }
         metadata
+    }
+
+    /// Find any primary keys explicitly defined in the [`View`]. Order of precedence:
+    ///  1. Primary key defined in `.columns[].embeddings[].row_id`
+    ///  2. Primary key defined in `.columns[].full_text_search[].row_id`
+    #[must_use]
+    pub fn primary_key_override(&self) -> Option<Vec<String>> {
+        self.columns
+            .iter()
+            .find_map(|c| c.embeddings.iter().find_map(|e| e.row_ids.clone()))
+            .or(self
+                .columns
+                .iter()
+                .find_map(|c| c.full_text_search.as_ref().and_then(|f| f.row_ids.clone())))
     }
 }
 
@@ -98,12 +135,48 @@ impl WithDependsOn<View> for View {
             name: self.name.clone(),
             description: self.description.clone(),
             metadata: self.metadata.clone(),
-            columns: vec![],
+            columns: self.columns.clone(),
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             acceleration: self.acceleration.clone(),
             ready_state: self.ready_state,
+            vectors: self.vectors.clone(),
+            params: self.params.clone(),
             depends_on: depends_on.to_vec(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_params_with_file_format() {
+        let yaml = r"
+name: my_view
+sql: SELECT body FROM docs
+params:
+  file_format: md
+";
+        let view: View = yaml::from_str(yaml).expect("view should deserialize");
+        let params = view.params.expect("params should be present");
+        assert_eq!(
+            params
+                .as_string_map()
+                .get("file_format")
+                .map(String::as_str),
+            Some("md")
+        );
+    }
+
+    #[test]
+    fn params_defaults_to_none_when_absent() {
+        let yaml = r"
+name: my_view
+sql: SELECT body FROM docs
+";
+        let view: View = yaml::from_str(yaml).expect("view should deserialize");
+        assert!(view.params.is_none());
     }
 }
